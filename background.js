@@ -561,10 +561,23 @@ const DAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 
 function extractDate(text, now) {
   const lowerText = text.toLowerCase();
 
+  // Debug logging helper
+  const debugLog = (pattern, matched, match = null) => {
+    if (CONFIG.DEBUG) {
+      console.log(`  [extractDate] Pattern "${pattern}": ${matched ? 'MATCHED' : 'no match'}${match ? ` → "${match}"` : ''}`);
+    }
+  };
+
+  if (CONFIG.DEBUG) {
+    console.log(`[extractDate] Input: "${text}"`);
+    console.log(`[extractDate] LowerText: "${lowerText}"`);
+  }
+
   // Order matters - check more specific patterns first
 
   // 1. ISO format: YYYY-MM-DD (check first to avoid confusion with other formats)
   const isoMatch = text.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+  debugLog('ISO (YYYY-MM-DD)', !!isoMatch, isoMatch?.[0]);
   if (isoMatch) {
     const year = parseInt(isoMatch[1], 10);
     const month = parseInt(isoMatch[2], 10) - 1;
@@ -576,20 +589,26 @@ function extractDate(text, now) {
   }
 
   // 2. Relative dates: today, tomorrow, day after tomorrow
-  if (/\btoday\b/.test(lowerText)) {
+  const todayMatch = /\btoday\b/.test(lowerText);
+  debugLog('today', todayMatch);
+  if (todayMatch) {
     const date = new Date(now);
     date.setHours(0, 0, 0, 0);
     return { date, type: 'relative-today' };
   }
 
-  if (/\btomorrow\b/.test(lowerText)) {
+  const tomorrowMatch = /\btomorrow\b/.test(lowerText);
+  debugLog('tomorrow', tomorrowMatch);
+  if (tomorrowMatch) {
     const date = new Date(now);
     date.setDate(date.getDate() + 1);
     date.setHours(0, 0, 0, 0);
     return { date, type: 'relative-tomorrow' };
   }
 
-  if (/\b(day after tomorrow|day after tmrw)\b/.test(lowerText)) {
+  const dayAfterMatch = /\b(day after tomorrow|day after tmrw)\b/.test(lowerText);
+  debugLog('day after tomorrow', dayAfterMatch);
+  if (dayAfterMatch) {
     const date = new Date(now);
     date.setDate(date.getDate() + 2);
     date.setHours(0, 0, 0, 0);
@@ -597,7 +616,9 @@ function extractDate(text, now) {
   }
 
   // 3. Next week
-  if (/\bnext\s+week\b/.test(lowerText)) {
+  const nextWeekMatch = /\bnext\s+week\b/.test(lowerText);
+  debugLog('next week', nextWeekMatch);
+  if (nextWeekMatch) {
     const date = new Date(now);
     date.setDate(date.getDate() + 7);
     date.setHours(0, 0, 0, 0);
@@ -606,6 +627,7 @@ function extractDate(text, now) {
 
   // 4. "next [day]" or "this [day]"
   const dayModifierMatch = lowerText.match(/\b(next|this)\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
+  debugLog('next/this [day]', !!dayModifierMatch, dayModifierMatch?.[0]);
   if (dayModifierMatch) {
     const modifier = dayModifierMatch[1];
     const targetDayName = dayModifierMatch[2];
@@ -636,6 +658,7 @@ function extractDate(text, now) {
 
   // 5. Standalone day names (next occurrence)
   const standaloneDayMatch = lowerText.match(/\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
+  debugLog('standalone day', !!standaloneDayMatch && !dayModifierMatch, standaloneDayMatch?.[0]);
   if (standaloneDayMatch && !dayModifierMatch) {
     const targetDay = DAYS.indexOf(standaloneDayMatch[1]);
     const date = new Date(now);
@@ -659,6 +682,7 @@ function extractDate(text, now) {
     'i'
   );
   const monthDayYearMatch = text.match(monthDayYearRegex);
+  debugLog('month day year', !!monthDayYearMatch, monthDayYearMatch?.[0]);
   if (monthDayYearMatch) {
     const month = MONTHS[monthDayYearMatch[1].toLowerCase()];
     const day = parseInt(monthDayYearMatch[2], 10);
@@ -674,7 +698,11 @@ function extractDate(text, now) {
     `\\b(${MONTH_PATTERN})\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b`,
     'i'
   );
+  if (CONFIG.DEBUG) {
+    console.log(`  [extractDate] Month-day regex pattern: ${monthDayRegex}`);
+  }
   const monthDayMatch = text.match(monthDayRegex);
+  debugLog('month day (no year)', !!monthDayMatch, monthDayMatch?.[0]);
   if (monthDayMatch) {
     const month = MONTHS[monthDayMatch[1].toLowerCase()];
     const day = parseInt(monthDayMatch[2], 10);
@@ -682,7 +710,10 @@ function extractDate(text, now) {
     let date = new Date(year, month, day);
 
     // If date is in the past, assume next year
-    if (date < now) {
+    // Compare dates only (not times) to avoid same-day issues
+    const todayMidnight = new Date(now);
+    todayMidnight.setHours(0, 0, 0, 0);
+    if (date < todayMidnight) {
       date = new Date(year + 1, month, day);
     }
 
@@ -697,6 +728,7 @@ function extractDate(text, now) {
     'i'
   );
   const dayMonthMatch = text.match(dayMonthRegex);
+  debugLog('day month (European)', !!dayMonthMatch, dayMonthMatch?.[0]);
   if (dayMonthMatch) {
     const day = parseInt(dayMonthMatch[1], 10);
     const month = MONTHS[dayMonthMatch[2].toLowerCase()];
@@ -704,7 +736,10 @@ function extractDate(text, now) {
     let date = new Date(year, month, day);
 
     // If no year specified and date is in the past, assume next year
-    if (!dayMonthMatch[3] && date < now) {
+    // Compare dates only (not times) to avoid same-day issues
+    const todayMidnight = new Date(now);
+    todayMidnight.setHours(0, 0, 0, 0);
+    if (!dayMonthMatch[3] && date < todayMidnight) {
       date = new Date(year + 1, month, day);
     }
 
@@ -715,6 +750,7 @@ function extractDate(text, now) {
 
   // 9. MM/DD/YYYY or MM-DD-YYYY
   const fullDateMatch = text.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b/);
+  debugLog('MM/DD/YYYY', !!fullDateMatch, fullDateMatch?.[0]);
   if (fullDateMatch) {
     const month = parseInt(fullDateMatch[1], 10) - 1;
     const day = parseInt(fullDateMatch[2], 10);
@@ -727,13 +763,17 @@ function extractDate(text, now) {
 
   // 10. MM/DD (no year)
   const shortDateMatch = text.match(/\b(\d{1,2})[\/\-](\d{1,2})\b(?![\/\-]\d)/);
+  debugLog('MM/DD (no year)', !!shortDateMatch, shortDateMatch?.[0]);
   if (shortDateMatch) {
     const month = parseInt(shortDateMatch[1], 10) - 1;
     const day = parseInt(shortDateMatch[2], 10);
     const year = now.getFullYear();
     let date = new Date(year, month, day);
 
-    if (date < now) {
+    // Compare dates only (not times) to avoid same-day issues
+    const todayMidnight = new Date(now);
+    todayMidnight.setHours(0, 0, 0, 0);
+    if (date < todayMidnight) {
       date = new Date(year + 1, month, day);
     }
 
@@ -742,6 +782,7 @@ function extractDate(text, now) {
     }
   }
 
+  debugLog('No date pattern matched', true);
   return { date: null, type: 'none' };
 }
 
@@ -1012,5 +1053,36 @@ function createGoogleCalendarUrl(eventData) {
   });
 
   return `${baseUrl}?${params.toString()}`;
+}
+
+// =============================================================================
+// TEST FUNCTION (for debugging from console)
+// =============================================================================
+
+/**
+ * Test function for debugging date/time parsing from the console
+ * Usage: testParsing("january 22, 9:30")
+ * @param {string} text - The text to parse
+ */
+function testParsing(text) {
+  console.log('='.repeat(60));
+  console.log('Testing:', text);
+  console.log('='.repeat(60));
+
+  const result = parseEventFromText(text);
+
+  console.log('\nRESULT:');
+  console.log('  Title:', result.title);
+  console.log('  Start:', result.startDate.toLocaleString());
+  console.log('  End:', result.endDate.toLocaleString());
+  console.log('  Confidence:', result.confidence);
+  console.log('  Description:', result.description);
+
+  return result;
+}
+
+// Make testParsing available globally for console access
+if (typeof globalThis !== 'undefined') {
+  globalThis.testParsing = testParsing;
 }
 
