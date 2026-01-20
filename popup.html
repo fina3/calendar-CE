@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Text to Calendar</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <div class="logo">
+        <span class="logo-icon">📅</span>
+        <h1>Text to Calendar</h1>
+      </div>
+      <p class="instructions">
+        Highlight text on any webpage, right-click, and select
+        <strong>"📅 Create Calendar Event"</strong> to add it to Google Calendar.
+      </p>
+    </header>
+
+    <section class="recent-section">
+      <h2>Recent Events</h2>
+      <div id="events-list" class="events-list">
+        <!-- Events will be rendered here -->
+      </div>
+      <div id="empty-state" class="empty-state">
+        <span class="empty-icon">📋</span>
+        <p>No events created yet</p>
+        <p class="empty-hint">Highlight some text and right-click to get started!</p>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <button id="clear-btn" class="btn btn-secondary">Clear History</button>
+    </footer>
+  </div>
+
+  <div id="confirm-modal" class="modal">
+    <div class="modal-content">
+      <p>Clear all event history?</p>
+      <div class="modal-actions">
+        <button id="confirm-cancel" class="btn btn-secondary">Cancel</button>
+        <button id="confirm-clear" class="btn btn-danger">Clear</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
