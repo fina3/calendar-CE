@@ -1,0 +1,21 @@
+{
+  "name": "text-to-calendar-extension",
+  "version": "1.0.0",
+  "description": "Chrome extension: Highlight text, right-click, and instantly create a Google Calendar event",
+  "private": true,
+  "scripts": {
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "build": "node scripts/build.js",
+    "prebuild": "npm run lint"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fina3/calendar-CE.git"
+  },
+  "author": "",
+  "license": "MIT"
+}

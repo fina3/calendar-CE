@@ -242,9 +242,9 @@ async function incrementSessionCount() {
 chrome.runtime.onInstalled.addListener(async () => {
   try {
     await chrome.contextMenus.create({
-      id: "createCalendarEvent",
-      title: "📅 Create Calendar Event",
-      contexts: ["selection"]
+      id: 'createCalendarEvent',
+      title: '📅 Create Calendar Event',
+      contexts: ['selection']
     });
     log('Context menu created');
   } catch (error) {
@@ -263,8 +263,8 @@ updateBadge();
 // =============================================================================
 
 // Handle context menu click
-chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId !== "createCalendarEvent" || !info.selectionText) {
+chrome.contextMenus.onClicked.addListener(async (info, _tab) => {
+  if (info.menuItemId !== 'createCalendarEvent' || !info.selectionText) {
     return;
   }
 
@@ -339,27 +339,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 async function handleMessage(message) {
   switch (message.action) {
-    case 'getRecentEvents':
-      const events = await EventStorage.getRecentEvents(message.limit || 5);
-      return { success: true, events };
+  case 'getRecentEvents':
+    const events = await EventStorage.getRecentEvents(message.limit || 5);
+    return { success: true, events };
 
-    case 'clearHistory':
-      await EventStorage.clearHistory();
-      return { success: true };
+  case 'clearHistory':
+    await EventStorage.clearHistory();
+    return { success: true };
 
-    case 'getEvent':
-      const event = await EventStorage.getEvent(message.id);
-      return { success: true, event };
+  case 'getEvent':
+    const event = await EventStorage.getEvent(message.id);
+    return { success: true, event };
 
-    case 'deleteEvent':
-      const deleted = await EventStorage.deleteEvent(message.id);
-      return { success: true, deleted };
+  case 'deleteEvent':
+    const deleted = await EventStorage.deleteEvent(message.id);
+    return { success: true, deleted };
 
-    case 'getSessionCount':
-      return { success: true, count: sessionEventCount };
+  case 'getSessionCount':
+    return { success: true, count: sessionEventCount };
 
-    default:
-      return { success: false, error: 'Unknown action' };
+  default:
+    return { success: false, error: 'Unknown action' };
   }
 }
 
@@ -417,7 +417,7 @@ function parseEventFromText(text) {
 
   // Extract duration or end time
   const durationResult = extractDuration(text, startHours, startMinutes);
-  let durationMs = durationResult.duration;
+  const durationMs = durationResult.duration;
   if (durationResult.found) {
     parsed.duration = true;
     if (durationResult.type === 'until') {
@@ -476,9 +476,15 @@ function calculateConfidence(parsed, text) {
     textLength: 0.10
   };
 
-  if (parsed.date) score += weights.date;
-  if (parsed.time) score += weights.time;
-  if (parsed.duration || parsed.endTime) score += weights.duration;
+  if (parsed.date) {
+    score += weights.date;
+  }
+  if (parsed.time) {
+    score += weights.time;
+  }
+  if (parsed.duration || parsed.endTime) {
+    score += weights.duration;
+  }
 
   // Bonus for reasonable text length (not too short, not too long)
   const textLength = text.trim().length;
@@ -612,11 +618,15 @@ function extractDate(text, now) {
 
     if (modifier === 'next') {
       // "next Monday" means the Monday of next week
-      if (daysToAdd <= 0) daysToAdd += 7;
+      if (daysToAdd <= 0) {
+        daysToAdd += 7;
+      }
       daysToAdd += 7; // Add another week for "next"
     } else {
       // "this Monday" means the upcoming Monday (or today if it's Monday)
-      if (daysToAdd < 0) daysToAdd += 7;
+      if (daysToAdd < 0) {
+        daysToAdd += 7;
+      }
       // If it's the same day, keep it (this Monday = today if today is Monday)
     }
 
@@ -668,7 +678,7 @@ function extractDate(text, now) {
   if (monthDayMatch) {
     const month = MONTHS[monthDayMatch[1].toLowerCase()];
     const day = parseInt(monthDayMatch[2], 10);
-    let year = now.getFullYear();
+    const year = now.getFullYear();
     let date = new Date(year, month, day);
 
     // If date is in the past, assume next year
@@ -690,7 +700,7 @@ function extractDate(text, now) {
   if (dayMonthMatch) {
     const day = parseInt(dayMonthMatch[1], 10);
     const month = MONTHS[dayMonthMatch[2].toLowerCase()];
-    let year = dayMonthMatch[3] ? parseInt(dayMonthMatch[3], 10) : now.getFullYear();
+    const year = dayMonthMatch[3] ? parseInt(dayMonthMatch[3], 10) : now.getFullYear();
     let date = new Date(year, month, day);
 
     // If no year specified and date is in the past, assume next year
@@ -720,7 +730,7 @@ function extractDate(text, now) {
   if (shortDateMatch) {
     const month = parseInt(shortDateMatch[1], 10) - 1;
     const day = parseInt(shortDateMatch[2], 10);
-    let year = now.getFullYear();
+    const year = now.getFullYear();
     let date = new Date(year, month, day);
 
     if (date < now) {
@@ -872,7 +882,9 @@ function extractDuration(text, startHours, startMinutes) {
     } else {
       // No meridiem - guess based on start time
       if (endHours <= 12 && endHours < (startHours % 12 || 12)) {
-        if (endHours !== 12) endHours += 12;
+        if (endHours !== 12) {
+          endHours += 12;
+        }
       } else if (endHours <= 7) {
         endHours += 12;
       }
@@ -987,13 +999,13 @@ function formatDateForCalendar(date) {
  * Create Google Calendar URL with parsed event data
  */
 function createGoogleCalendarUrl(eventData) {
-  const baseUrl = "https://calendar.google.com/calendar/render";
+  const baseUrl = 'https://calendar.google.com/calendar/render';
 
   const startFormatted = formatDateForCalendar(eventData.startDate);
   const endFormatted = formatDateForCalendar(eventData.endDate);
 
   const params = new URLSearchParams({
-    action: "TEMPLATE",
+    action: 'TEMPLATE',
     text: eventData.title,
     dates: `${startFormatted}/${endFormatted}`,
     details: eventData.description
@@ -1002,13 +1014,3 @@ function createGoogleCalendarUrl(eventData) {
   return `${baseUrl}?${params.toString()}`;
 }
 
-// =============================================================================
-// LEGACY WRAPPER (for backward compatibility)
-// =============================================================================
-
-/**
- * Legacy wrapper that calls parseEventFromText
- */
-function parseSelectedText(text) {
-  return parseEventFromText(text);
-}

@@ -136,6 +136,37 @@ text-to-calendar-extension/
 └── README.md          # This file
 ```
 
+### Building from Source
+
+```bash
+# Install dependencies
+npm install
+
+# Run linting
+npm run lint
+
+# Auto-fix linting issues
+npm run lint:fix
+
+# Build extension zip (outputs to dist/)
+npm run build
+```
+
+The build script creates a zip file in `dist/` that can be uploaded to the Chrome Web Store.
+
+### Creating a Release
+
+To create a new release:
+
+1. Update the version in `manifest.json`
+2. Commit your changes
+3. Create and push a tag:
+   ```bash
+   git tag v1.0.1
+   git push origin v1.0.1
+   ```
+4. GitHub Actions will automatically create a release with the extension zip
+
 ### Enabling Debug Mode
 
 To enable detailed console logging, edit `background.js` and set:

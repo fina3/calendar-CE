@@ -16,7 +16,7 @@ npm-debug.log*
 .env.*.local
 
 # Build artifacts
-*.zip
+dist/
 *.crx
 *.pem
 
@@ -29,3 +29,6 @@ npm-debug.log*
 # Temporary files
 *.tmp
 *.temp
+
+# Package lock (optional - remove if you want to track it)
+package-lock.json
