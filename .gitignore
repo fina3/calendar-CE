@@ -29,6 +29,3 @@ dist/
 # Temporary files
 *.tmp
 *.temp
-
-# Package lock (optional - remove if you want to track it)
-package-lock.json
