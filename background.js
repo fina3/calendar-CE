@@ -695,7 +695,7 @@ function extractDate(text, now) {
 
   // 7. Month day (no year): "January 5" / "Jan 5th"
   const monthDayRegex = new RegExp(
-    `\\b(${MONTH_PATTERN})\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b`,
+    `\\b(${MONTH_PATTERN})\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:\\b|,|$)`,
     'i'
   );
   if (CONFIG.DEBUG) {
