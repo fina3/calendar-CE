@@ -404,26 +404,57 @@ function parseEventFromText(text) {
     log('Extracted date:', baseDate, `(${dateResult.type})`);
   }
 
-  // Extract start time
-  const timeResult = extractTime(text);
+  // Check for time range FIRST (e.g., "6-8pm", "10am-2pm")
+  const timeRangeResult = extractTimeRange(text);
   let startHours = null;
   let startMinutes = 0;
-  if (timeResult.found) {
-    startHours = timeResult.hours;
-    startMinutes = timeResult.minutes;
+  let durationMs = CONFIG.DEFAULT_DURATION_MS;
+  let durationFromRange = false;
+
+  if (timeRangeResult.found) {
+    // Use time range for both start time and duration
+    startHours = timeRangeResult.startHours;
+    startMinutes = timeRangeResult.startMinutes;
     parsed.time = true;
-    log(`Extracted time: ${startHours}:${String(startMinutes).padStart(2, '0')} (${timeResult.type})`);
+    parsed.endTime = true;
+
+    // Calculate duration from the range
+    const startTotalMinutes = timeRangeResult.startHours * 60 + timeRangeResult.startMinutes;
+    let endTotalMinutes = timeRangeResult.endHours * 60 + timeRangeResult.endMinutes;
+
+    // If end is before start, assume next day
+    if (endTotalMinutes <= startTotalMinutes) {
+      endTotalMinutes += 24 * 60;
+    }
+
+    durationMs = (endTotalMinutes - startTotalMinutes) * 60 * 1000;
+    durationFromRange = true;
+    parsed.duration = true;
+
+    log(`Extracted time range: ${startHours}:${String(startMinutes).padStart(2, '0')} - ${timeRangeResult.endHours}:${String(timeRangeResult.endMinutes).padStart(2, '0')} (${timeRangeResult.type})`);
+    log(`Duration from range: ${durationMs / 60000} minutes`);
+  } else {
+    // Fall back to single time extraction
+    const timeResult = extractTime(text);
+    if (timeResult.found) {
+      startHours = timeResult.hours;
+      startMinutes = timeResult.minutes;
+      parsed.time = true;
+      log(`Extracted time: ${startHours}:${String(startMinutes).padStart(2, '0')} (${timeResult.type})`);
+    }
   }
 
-  // Extract duration or end time
-  const durationResult = extractDuration(text, startHours, startMinutes);
-  const durationMs = durationResult.duration;
-  if (durationResult.found) {
-    parsed.duration = true;
-    if (durationResult.type === 'until') {
-      parsed.endTime = true;
+  // Extract duration or end time (only if not already from time range)
+  if (!durationFromRange) {
+    const durationResult = extractDuration(text, startHours, startMinutes);
+    durationMs = durationResult.duration;
+    if (durationResult.found) {
+      parsed.duration = true;
+      if (durationResult.type === 'until') {
+        parsed.endTime = true;
+      }
+      log(`Extracted duration: ${durationMs / 60000} minutes (${durationResult.type})`);
     }
-    log(`Extracted duration: ${durationMs / 60000} minutes (${durationResult.type})`);
   }
 
   // Assemble the start date/time
@@ -796,6 +827,119 @@ function isValidDate(date) {
 // =============================================================================
 // TIME EXTRACTION
 // =============================================================================
+
+/**
+ * Extract a time range from text (e.g., "6-8pm", "6pm-8pm", "10am-2pm")
+ * @param {string} text - The text to parse
+ * @returns {Object} - { found, startHours, startMinutes, endHours, endMinutes, type }
+ */
+function extractTimeRange(text) {
+  const lowerText = text.toLowerCase();
+
+  log('[extractTimeRange] Input:', text);
+
+  // Time range patterns:
+  // Pattern 1: "6-8pm", "6-8 pm", "6 - 8pm" (meridiem only on end)
+  // Pattern 2: "6pm-8pm", "6pm - 8pm" (meridiem on both)
+  // Pattern 3: "6:00-8:00pm", "6:30-8:30pm" (with minutes, meridiem on end)
+  // Pattern 4: "6:00pm-8:00pm" (with minutes, meridiem on both)
+  // Pattern 5: "6pm to 8pm", "6 to 8pm" (using "to" instead of dash)
+  // Pattern 6: "10am-2pm" (different meridiems - crosses noon)
+
+  // Comprehensive regex that handles all patterns
+  // Groups: 1=startHour, 2=startMin, 3=startMeridiem, 4=endHour, 5=endMin, 6=endMeridiem
+  const timeRangeRegex = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.?|p\.m\.?)?\s*(?:-|–|to)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.?|p\.m\.?)\b/i;
+
+  const match = text.match(timeRangeRegex);
+
+  if (match) {
+    log('[extractTimeRange] Match found:', match[0]);
+    log('[extractTimeRange] Groups:', {
+      startHour: match[1],
+      startMin: match[2],
+      startMeridiem: match[3],
+      endHour: match[4],
+      endMin: match[5],
+      endMeridiem: match[6]
+    });
+
+    let startHours = parseInt(match[1], 10);
+    const startMinutes = match[2] ? parseInt(match[2], 10) : 0;
+    const startMeridiem = match[3];
+
+    let endHours = parseInt(match[4], 10);
+    const endMinutes = match[5] ? parseInt(match[5], 10) : 0;
+    const endMeridiem = match[6];
+
+    // Validate hour values
+    if (startHours < 1 || startHours > 12 || endHours < 1 || endHours > 12) {
+      log('[extractTimeRange] Invalid hour values, skipping');
+      return { found: false, startHours: null, startMinutes: 0, endHours: null, endMinutes: 0, type: 'none' };
+    }
+
+    // Convert end time to 24-hour format
+    const endIsPM = /^p/i.test(endMeridiem);
+    if (endIsPM && endHours !== 12) {
+      endHours += 12;
+    } else if (!endIsPM && endHours === 12) {
+      endHours = 0;
+    }
+
+    // Convert start time to 24-hour format
+    if (startMeridiem) {
+      // Start has explicit meridiem
+      const startIsPM = /^p/i.test(startMeridiem);
+      if (startIsPM && startHours !== 12) {
+        startHours += 12;
+      } else if (!startIsPM && startHours === 12) {
+        startHours = 0;
+      }
+    } else {
+      // Infer start meridiem from end meridiem and logic
+      // "6-8pm" → both PM (6pm-8pm)
+      // "10-2pm" → 10am-2pm (crosses noon, start must be AM)
+      // "6-8am" → both AM
+
+      if (endIsPM) {
+        // End is PM
+        if (startHours <= endHours % 12 || endHours % 12 === 0) {
+          // Same meridiem: "6-8pm" → 6pm, 8pm
+          if (startHours !== 12) {
+            startHours += 12;
+          }
+        } else {
+          // Crosses noon: "10-2pm" → 10am, 2pm
+          // startHours stays as-is (AM)
+          if (startHours === 12) {
+            startHours = 0; // 12 without meridiem before PM end = 12am = 0
+          }
+        }
+      } else {
+        // End is AM - start is also AM
+        if (startHours === 12) {
+          startHours = 0;
+        }
+      }
+    }
+
+    log('[extractTimeRange] Parsed times:', {
+      start: `${startHours}:${String(startMinutes).padStart(2, '0')}`,
+      end: `${endHours}:${String(endMinutes).padStart(2, '0')}`
+    });
+
+    return {
+      found: true,
+      startHours,
+      startMinutes,
+      endHours,
+      endMinutes,
+      type: 'time-range'
+    };
+  }
+
+  log('[extractTimeRange] No time range found');
+  return { found: false, startHours: null, startMinutes: 0, endHours: null, endMinutes: 0, type: 'none' };
+}
 
 /**
  * Extract time from text
