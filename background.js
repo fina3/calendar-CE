@@ -211,26 +211,31 @@ const EventStorage = {
 /**
  * Update the extension badge with session event count
  */
-async function updateBadge() {
+function updateBadge() {
+  // Don't run if service worker APIs aren't ready
+  if (typeof chrome === 'undefined' || !chrome.action) {
+    return;
+  }
+
   try {
     if (sessionEventCount > 0) {
       const text = sessionEventCount > 99 ? '99+' : String(sessionEventCount);
-      await chrome.action.setBadgeText({ text });
-      await chrome.action.setBadgeBackgroundColor({ color: '#4285f4' });
+      chrome.action.setBadgeText({ text });
+      chrome.action.setBadgeBackgroundColor({ color: '#4285f4' });
     } else {
-      await chrome.action.setBadgeText({ text: '' });
+      chrome.action.setBadgeText({ text: '' });
     }
   } catch (error) {
-    logError('Error updating badge:', error);
+    // Silently ignore - badge is not critical functionality
   }
 }
 
 /**
  * Increment session event count and update badge
  */
-async function incrementSessionCount() {
+function incrementSessionCount() {
   sessionEventCount++;
-  await updateBadge();
+  updateBadge();
   log(`Session count: ${sessionEventCount}`);
 }
 
@@ -252,11 +257,8 @@ chrome.runtime.onInstalled.addListener(async () => {
   }
 
   // Clear badge on install/update
-  await updateBadge();
+  updateBadge();
 });
-
-// Initialize badge on service worker startup
-updateBadge();
 
 // =============================================================================
 // CONTEXT MENU HANDLER
@@ -291,7 +293,7 @@ chrome.contextMenus.onClicked.addListener(async (info, _tab) => {
     // Save to event history
     try {
       await EventStorage.saveEvent(eventData, calendarUrl, selectedText);
-      await incrementSessionCount();
+      incrementSessionCount();
 
       // Show success notification
       await showNotification(
