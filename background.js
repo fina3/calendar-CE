@@ -434,7 +434,7 @@ async function handleMessage(message) {
 /**
  * Parse selected text to extract event details with confidence scoring
  * @param {string} text - The selected text to parse
- * @returns {Object} - { title, startDate, endDate, description, confidence }
+ * @returns {Object} - { title, startDate, endDate, description, confidence, recurrence }
  */
 function parseEventFromText(text) {
   const now = new Date();
@@ -443,7 +443,12 @@ function parseEventFromText(text) {
     startDate: null,
     endDate: null,
     description: text,
-    confidence: 0
+    confidence: 0,
+    recurrence: {
+      isRecurring: false,
+      days: [],
+      frequency: null
+    }
   };
 
   // Track what we successfully parsed for confidence calculation
@@ -552,6 +557,29 @@ function parseEventFromText(text) {
   // Calculate end date
   parseResult.endDate = new Date(parseResult.startDate.getTime() + durationMs);
 
+  // Check for recurring weekday patterns (MWF, TTh, etc.)
+  const weekdayResult = parseWeekdays(text);
+  if (weekdayResult.found) {
+    parseResult.recurrence = {
+      isRecurring: true,
+      days: weekdayResult.days,
+      frequency: 'WEEKLY'
+    };
+    log('Found recurring pattern:', weekdayResult.days.join(','), `(from "${weekdayResult.original}")`);
+
+    // If no explicit date was found, use the next occurrence of the first day
+    if (!parsed.date && weekdayResult.days.length > 0) {
+      const nextDay = getNextWeekday(now, weekdayResult.days[0]);
+      parseResult.startDate.setFullYear(nextDay.getFullYear());
+      parseResult.startDate.setMonth(nextDay.getMonth());
+      parseResult.startDate.setDate(nextDay.getDate());
+      log('Set start date to next', weekdayResult.days[0], ':', parseResult.startDate.toDateString());
+
+      // Recalculate end date
+      parseResult.endDate = new Date(parseResult.startDate.getTime() + durationMs);
+    }
+  }
+
   // Calculate confidence score (0-1)
   parseResult.confidence = calculateConfidence(parsed, text);
   log('Confidence score:', parseResult.confidence);
@@ -610,6 +638,13 @@ function cleanTitle(text) {
 
   // Abbreviated day names: Mon, Tue, Wed, Thu, Fri, Sat, Sun
   result = result.replace(/\b(mon|tue|wed|thu|fri|sat|sun)\b,?\s*/gi, '');
+
+  // Compact weekday codes: MWF, TTh, MTWThF, MW, TR, etc.
+  // Match sequences of day letters (at least 2 chars) that look like schedules
+  result = result.replace(/\b[MTWRFSU][MTWRFSUhau]{1,}\b/g, '');
+
+  // Class type indicators: LEC, LAB, DIS, SEM (lecture, lab, discussion, seminar)
+  result = result.replace(/\b(LEC|LAB|DIS|SEM|LECTURE|DISCUSSION|SEMINAR|LABORATORY)\b/gi, '');
 
   // Relative dates
   result = result.replace(/\b(today|tomorrow|day after tomorrow|next\s+week|this\s+week)\b/gi, '');
@@ -1314,6 +1349,130 @@ function extractDuration(text, startHours, startMinutes) {
 }
 
 // =============================================================================
+// RECURRING EVENT PARSING
+// =============================================================================
+
+/**
+ * Parse compact weekday codes from text (e.g., MWF, TTh, MTWThF)
+ * @param {string} text - The text to parse
+ * @returns {Object} - { found: boolean, days: ['MO', 'WE', 'FR'], original: 'MWF' }
+ */
+function parseWeekdays(text) {
+  // Map of day codes to Google Calendar format
+  const dayMap = {
+    'SU': 'SU', 'U': 'SU',           // Sunday
+    'MO': 'MO', 'M': 'MO',           // Monday
+    'TU': 'TU', 'T': 'TU',           // Tuesday
+    'WE': 'WE', 'W': 'WE',           // Wednesday
+    'TH': 'TH', 'R': 'TH',           // Thursday (R is common academic notation)
+    'FR': 'FR', 'F': 'FR',           // Friday
+    'SA': 'SA', 'S': 'SA'            // Saturday
+  };
+
+  // Day order for sorting
+  const dayOrder = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
+
+  // Try to find compact weekday codes like MWF, TTh, MTWThF
+  // This regex looks for standalone sequences of day letters
+  // Must have at least 2 characters and be word-bounded
+  const compactPattern = /\b([MTWRFSU][MTWRFSUhau]{1,})\b/g;
+
+  let match;
+  while ((match = compactPattern.exec(text)) !== null) {
+    const code = match[1];
+    const days = [];
+    let i = 0;
+
+    while (i < code.length) {
+      const remaining = code.substring(i).toUpperCase();
+
+      // Check for two-letter codes first (Th, Sa, Su)
+      if (remaining.length >= 2) {
+        const twoChar = remaining.substring(0, 2);
+        if (twoChar === 'TH' || twoChar === 'SA' || twoChar === 'SU') {
+          days.push(dayMap[twoChar]);
+          i += 2;
+          continue;
+        }
+      }
+
+      // Single letter codes
+      const oneChar = remaining[0];
+      if (dayMap[oneChar]) {
+        days.push(dayMap[oneChar]);
+        i += 1;
+      } else {
+        // Unknown character, skip it
+        i += 1;
+      }
+    }
+
+    // Only return if we found multiple unique days (recurring pattern)
+    const uniqueDays = [...new Set(days)];
+    if (uniqueDays.length >= 2) {
+      // Sort by day order
+      uniqueDays.sort((a, b) => dayOrder.indexOf(a) - dayOrder.indexOf(b));
+      return { found: true, days: uniqueDays, original: match[1] };
+    }
+  }
+
+  // Try spaced/comma/slash formats: "M, W, F" or "Mon Wed Fri" or "Tue/Thu"
+  const spacedPattern = /\b((?:mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)(?:\s*[,\/\s]\s*(?:mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday))+)\b/gi;
+
+  const spacedMatch = text.match(spacedPattern);
+  if (spacedMatch) {
+    const dayWords = spacedMatch[0].toLowerCase().split(/[\s,\/]+/);
+    const days = [];
+
+    const wordMap = {
+      'mon': 'MO', 'monday': 'MO',
+      'tue': 'TU', 'tuesday': 'TU',
+      'wed': 'WE', 'wednesday': 'WE',
+      'thu': 'TH', 'thursday': 'TH',
+      'fri': 'FR', 'friday': 'FR',
+      'sat': 'SA', 'saturday': 'SA',
+      'sun': 'SU', 'sunday': 'SU'
+    };
+
+    for (const word of dayWords) {
+      if (wordMap[word]) {
+        days.push(wordMap[word]);
+      }
+    }
+
+    const uniqueDays = [...new Set(days)];
+    if (uniqueDays.length >= 2) {
+      uniqueDays.sort((a, b) => dayOrder.indexOf(a) - dayOrder.indexOf(b));
+      return { found: true, days: uniqueDays, original: spacedMatch[0] };
+    }
+  }
+
+  return { found: false, days: [], original: null };
+}
+
+/**
+ * Get the next occurrence of a specific weekday
+ * @param {Date} fromDate - Starting date
+ * @param {string} dayCode - Day code like 'MO', 'TU', etc.
+ * @returns {Date} - The next occurrence of that day
+ */
+function getNextWeekday(fromDate, dayCode) {
+  const dayMap = { 'SU': 0, 'MO': 1, 'TU': 2, 'WE': 3, 'TH': 4, 'FR': 5, 'SA': 6 };
+  const targetDay = dayMap[dayCode];
+  const currentDay = fromDate.getDay();
+
+  let daysToAdd = targetDay - currentDay;
+  if (daysToAdd < 0) {
+    daysToAdd += 7;
+  }
+  // If it's the same day, use today (daysToAdd = 0)
+
+  const result = new Date(fromDate);
+  result.setDate(result.getDate() + daysToAdd);
+  return result;
+}
+
+// =============================================================================
 // CALENDAR URL GENERATION
 // =============================================================================
 
@@ -1348,6 +1507,13 @@ function createGoogleCalendarUrl(eventData) {
     dates: `${startFormatted}/${endFormatted}`,
     details: eventData.description
   });
+
+  // Add recurrence rule if this is a recurring event
+  if (eventData.recurrence && eventData.recurrence.isRecurring) {
+    const rrule = `RRULE:FREQ=${eventData.recurrence.frequency};BYDAY=${eventData.recurrence.days.join(',')}`;
+    params.append('recur', rrule);
+    log('Added recurrence rule:', rrule);
+  }
 
   return `${baseUrl}?${params.toString()}`;
 }
