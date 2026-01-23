@@ -668,9 +668,10 @@ function extractDate(text, now) {
     console.log(`[extractDate] LowerText: "${lowerText}"`);
   }
 
-  // Order matters - check more specific patterns first
+  // Order matters - SPECIFIC dates beat GENERAL day names
+  // Check numeric/explicit date formats BEFORE day names
 
-  // 1. ISO format: YYYY-MM-DD (check first to avoid confusion with other formats)
+  // 1. ISO format: YYYY-MM-DD (most specific, check first)
   const isoMatch = text.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
   debugLog('ISO (YYYY-MM-DD)', !!isoMatch, isoMatch?.[0]);
   if (isoMatch) {
@@ -683,7 +684,117 @@ function extractDate(text, now) {
     }
   }
 
-  // 2. Relative dates: today, tomorrow, day after tomorrow
+  // 2. MM/DD/YYYY or MM-DD-YYYY (full date with year)
+  const fullDateMatch = text.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b/);
+  debugLog('MM/DD/YYYY', !!fullDateMatch, fullDateMatch?.[0]);
+  if (fullDateMatch) {
+    const month = parseInt(fullDateMatch[1], 10) - 1;
+    const day = parseInt(fullDateMatch[2], 10);
+    const year = parseInt(fullDateMatch[3], 10);
+    const date = new Date(year, month, day);
+    if (isValidDate(date)) {
+      return { date, type: 'mm-dd-yyyy' };
+    }
+  }
+
+  // 3. Month day year: "January 5, 2025" / "Jan 5 2025" / "January 5th, 2025"
+  const monthDayYearRegex = new RegExp(
+    `\\b(${MONTH_PATTERN})\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:[,\\s]+|\\s+)(\\d{4})\\b`,
+    'i'
+  );
+  const monthDayYearMatch = text.match(monthDayYearRegex);
+  debugLog('month day year', !!monthDayYearMatch, monthDayYearMatch?.[0]);
+  if (monthDayYearMatch) {
+    const month = MONTHS[monthDayYearMatch[1].toLowerCase()];
+    const day = parseInt(monthDayYearMatch[2], 10);
+    const year = parseInt(monthDayYearMatch[3], 10);
+    const date = new Date(year, month, day);
+    if (isValidDate(date)) {
+      return { date, type: 'month-day-year' };
+    }
+  }
+
+  // 4. MM/DD (no year) - use negative lookbehind to avoid matching times like "11:59"
+  // Only match if preceded by word boundary or space, not by colon
+  const shortDateMatch = text.match(/(?<!:)\b(\d{1,2})\/(\d{1,2})\b(?!\/\d)/);
+  debugLog('MM/DD (no year)', !!shortDateMatch, shortDateMatch?.[0]);
+  if (shortDateMatch) {
+    const month = parseInt(shortDateMatch[1], 10);
+    const day = parseInt(shortDateMatch[2], 10);
+    // Validate month (1-12) and day (1-31) ranges
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      const year = now.getFullYear();
+      let date = new Date(year, month - 1, day);
+
+      // Compare dates only (not times) to avoid same-day issues
+      const todayMidnight = new Date(now);
+      todayMidnight.setHours(0, 0, 0, 0);
+      if (date < todayMidnight) {
+        date = new Date(year + 1, month - 1, day);
+      }
+
+      if (isValidDate(date)) {
+        return { date, type: 'mm-dd' };
+      }
+    }
+  }
+
+  // 5. Month day (no year): "January 5" / "Jan 5th"
+  const monthDayRegex = new RegExp(
+    `\\b(${MONTH_PATTERN})\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:\\b|,|$)`,
+    'i'
+  );
+  if (CONFIG.DEBUG) {
+    console.log(`  [extractDate] Month-day regex pattern: ${monthDayRegex}`);
+  }
+  const monthDayMatch = text.match(monthDayRegex);
+  debugLog('month day (no year)', !!monthDayMatch, monthDayMatch?.[0]);
+  if (monthDayMatch) {
+    const month = MONTHS[monthDayMatch[1].toLowerCase()];
+    const day = parseInt(monthDayMatch[2], 10);
+    const year = now.getFullYear();
+    let date = new Date(year, month, day);
+
+    // If date is in the past, assume next year
+    // Compare dates only (not times) to avoid same-day issues
+    const todayMidnight = new Date(now);
+    todayMidnight.setHours(0, 0, 0, 0);
+    if (date < todayMidnight) {
+      date = new Date(year + 1, month, day);
+    }
+
+    if (isValidDate(date)) {
+      return { date, type: 'month-day' };
+    }
+  }
+
+  // 6. Day month (European format): "5 January" / "5th January 2025"
+  const dayMonthRegex = new RegExp(
+    `\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(${MONTH_PATTERN})(?:\\s+(\\d{4}))?\\b`,
+    'i'
+  );
+  const dayMonthMatch = text.match(dayMonthRegex);
+  debugLog('day month (European)', !!dayMonthMatch, dayMonthMatch?.[0]);
+  if (dayMonthMatch) {
+    const day = parseInt(dayMonthMatch[1], 10);
+    const month = MONTHS[dayMonthMatch[2].toLowerCase()];
+    const year = dayMonthMatch[3] ? parseInt(dayMonthMatch[3], 10) : now.getFullYear();
+    let date = new Date(year, month, day);
+
+    // If no year specified and date is in the past, assume next year
+    // Compare dates only (not times) to avoid same-day issues
+    const todayMidnight = new Date(now);
+    todayMidnight.setHours(0, 0, 0, 0);
+    if (!dayMonthMatch[3] && date < todayMidnight) {
+      date = new Date(year + 1, month, day);
+    }
+
+    if (isValidDate(date)) {
+      return { date, type: 'day-month' };
+    }
+  }
+
+  // 7. Relative dates: today, tomorrow, day after tomorrow
   const todayMatch = /\btoday\b/.test(lowerText);
   debugLog('today', todayMatch);
   if (todayMatch) {
@@ -710,7 +821,7 @@ function extractDate(text, now) {
     return { date, type: 'relative-dayafter' };
   }
 
-  // 3. Next week
+  // 8. Next week
   const nextWeekMatch = /\bnext\s+week\b/.test(lowerText);
   debugLog('next week', nextWeekMatch);
   if (nextWeekMatch) {
@@ -720,7 +831,7 @@ function extractDate(text, now) {
     return { date, type: 'relative-nextweek' };
   }
 
-  // 4. "next [day]" or "this [day]"
+  // 9. "next [day]" or "this [day]"
   const dayModifierMatch = lowerText.match(/\b(next|this)\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
   debugLog('next/this [day]', !!dayModifierMatch, dayModifierMatch?.[0]);
   if (dayModifierMatch) {
@@ -751,7 +862,7 @@ function extractDate(text, now) {
     return { date, type: `day-${modifier}` };
   }
 
-  // 5. Standalone day names (next occurrence)
+  // 10. Standalone day names (next occurrence) - LAST because least specific
   const standaloneDayMatch = lowerText.match(/\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
   debugLog('standalone day', !!standaloneDayMatch && !dayModifierMatch, standaloneDayMatch?.[0]);
   if (standaloneDayMatch && !dayModifierMatch) {
@@ -769,112 +880,6 @@ function extractDate(text, now) {
 
     date.setDate(date.getDate() + daysToAdd);
     return { date, type: 'day-standalone' };
-  }
-
-  // 6. Month day year: "January 5, 2025" / "Jan 5 2025" / "January 5th, 2025"
-  const monthDayYearRegex = new RegExp(
-    `\\b(${MONTH_PATTERN})\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:[,\\s]+|\\s+)(\\d{4})\\b`,
-    'i'
-  );
-  const monthDayYearMatch = text.match(monthDayYearRegex);
-  debugLog('month day year', !!monthDayYearMatch, monthDayYearMatch?.[0]);
-  if (monthDayYearMatch) {
-    const month = MONTHS[monthDayYearMatch[1].toLowerCase()];
-    const day = parseInt(monthDayYearMatch[2], 10);
-    const year = parseInt(monthDayYearMatch[3], 10);
-    const date = new Date(year, month, day);
-    if (isValidDate(date)) {
-      return { date, type: 'month-day-year' };
-    }
-  }
-
-  // 7. Month day (no year): "January 5" / "Jan 5th"
-  const monthDayRegex = new RegExp(
-    `\\b(${MONTH_PATTERN})\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:\\b|,|$)`,
-    'i'
-  );
-  if (CONFIG.DEBUG) {
-    console.log(`  [extractDate] Month-day regex pattern: ${monthDayRegex}`);
-  }
-  const monthDayMatch = text.match(monthDayRegex);
-  debugLog('month day (no year)', !!monthDayMatch, monthDayMatch?.[0]);
-  if (monthDayMatch) {
-    const month = MONTHS[monthDayMatch[1].toLowerCase()];
-    const day = parseInt(monthDayMatch[2], 10);
-    const year = now.getFullYear();
-    let date = new Date(year, month, day);
-
-    // If date is in the past, assume next year
-    // Compare dates only (not times) to avoid same-day issues
-    const todayMidnight = new Date(now);
-    todayMidnight.setHours(0, 0, 0, 0);
-    if (date < todayMidnight) {
-      date = new Date(year + 1, month, day);
-    }
-
-    if (isValidDate(date)) {
-      return { date, type: 'month-day' };
-    }
-  }
-
-  // 8. Day month (European format): "5 January" / "5th January 2025"
-  const dayMonthRegex = new RegExp(
-    `\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(${MONTH_PATTERN})(?:\\s+(\\d{4}))?\\b`,
-    'i'
-  );
-  const dayMonthMatch = text.match(dayMonthRegex);
-  debugLog('day month (European)', !!dayMonthMatch, dayMonthMatch?.[0]);
-  if (dayMonthMatch) {
-    const day = parseInt(dayMonthMatch[1], 10);
-    const month = MONTHS[dayMonthMatch[2].toLowerCase()];
-    const year = dayMonthMatch[3] ? parseInt(dayMonthMatch[3], 10) : now.getFullYear();
-    let date = new Date(year, month, day);
-
-    // If no year specified and date is in the past, assume next year
-    // Compare dates only (not times) to avoid same-day issues
-    const todayMidnight = new Date(now);
-    todayMidnight.setHours(0, 0, 0, 0);
-    if (!dayMonthMatch[3] && date < todayMidnight) {
-      date = new Date(year + 1, month, day);
-    }
-
-    if (isValidDate(date)) {
-      return { date, type: 'day-month' };
-    }
-  }
-
-  // 9. MM/DD/YYYY or MM-DD-YYYY
-  const fullDateMatch = text.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b/);
-  debugLog('MM/DD/YYYY', !!fullDateMatch, fullDateMatch?.[0]);
-  if (fullDateMatch) {
-    const month = parseInt(fullDateMatch[1], 10) - 1;
-    const day = parseInt(fullDateMatch[2], 10);
-    const year = parseInt(fullDateMatch[3], 10);
-    const date = new Date(year, month, day);
-    if (isValidDate(date)) {
-      return { date, type: 'mm-dd-yyyy' };
-    }
-  }
-
-  // 10. MM/DD (no year)
-  const shortDateMatch = text.match(/\b(\d{1,2})[\/\-](\d{1,2})\b(?![\/\-]\d)/);
-  debugLog('MM/DD (no year)', !!shortDateMatch, shortDateMatch?.[0]);
-  if (shortDateMatch) {
-    const month = parseInt(shortDateMatch[1], 10) - 1;
-    const day = parseInt(shortDateMatch[2], 10);
-    const year = now.getFullYear();
-    let date = new Date(year, month, day);
-
-    // Compare dates only (not times) to avoid same-day issues
-    const todayMidnight = new Date(now);
-    todayMidnight.setHours(0, 0, 0, 0);
-    if (date < todayMidnight) {
-      date = new Date(year + 1, month, day);
-    }
-
-    if (isValidDate(date)) {
-      return { date, type: 'mm-dd' };
-    }
   }
 
   debugLog('No date pattern matched', true);
