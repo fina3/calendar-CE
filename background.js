@@ -597,25 +597,100 @@ function calculateConfidence(parsed, text) {
 // =============================================================================
 
 /**
+ * Clean date/time patterns from title text
+ * @param {string} text - The text to clean
+ * @returns {string} - Text with date/time patterns removed
+ */
+function cleanTitle(text) {
+  let result = text;
+
+  // Day names (with optional DUE prefix)
+  result = result.replace(/\b(DUE\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b,?/gi, '');
+
+  // Relative dates
+  result = result.replace(/\b(today|tomorrow|day after tomorrow|next\s+week|this\s+week)\b/gi, '');
+
+  // Time ranges: "6-8pm", "9am-5pm", "10:00am-2:00pm"
+  result = result.replace(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.?|p\.m\.?)?\s*[-–to]+\s*\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.?|p\.m\.?)\b/gi, '');
+
+  // Times with "at": "at 3pm", "at 11:59 PM", "at noon", "at midnight"
+  result = result.replace(/\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.?|p\.m\.?)?/gi, '');
+  result = result.replace(/\bat\s+(?:noon|midnight)\b/gi, '');
+
+  // Standalone times: "3pm", "11:59 PM", "3:00 pm"
+  result = result.replace(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.?|p\.m\.?)\b/gi, '');
+
+  // Time of day words: "morning", "afternoon", "evening", "night"
+  result = result.replace(/\b(?:in\s+the\s+)?(?:morning|afternoon|evening|night)\b/gi, '');
+
+  // Dates: MM/DD/YYYY, MM/DD, MM-DD-YYYY, MM-DD
+  result = result.replace(/\b\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?\b/gi, '');
+
+  // Month day year: "January 5, 2025", "Jan 5 2025", "January 5th"
+  const monthPattern = 'january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sept|sep|october|oct|november|nov|december|dec';
+  result = result.replace(new RegExp(`\\b(${monthPattern})\\s+\\d{1,2}(?:st|nd|rd|th)?(?:[,\\s]+\\d{4})?\\b`, 'gi'), '');
+
+  // Day month: "5 January", "5th January 2025"
+  result = result.replace(new RegExp(`\\b\\d{1,2}(?:st|nd|rd|th)?\\s+(${monthPattern})(?:\\s+\\d{4})?\\b`, 'gi'), '');
+
+  // ISO dates: 2025-01-25
+  result = result.replace(/\b\d{4}-\d{2}-\d{2}\b/g, '');
+
+  // Duration phrases: "for 2 hours", "for 30 minutes", "for an hour"
+  result = result.replace(/\bfor\s+(?:an?\s+)?(?:\d+(?:\.\d+)?\s*)?(?:hours?|hrs?|minutes?|mins?|half\s+(?:an?\s+)?hour)\b/gi, '');
+
+  // "until" phrases: "until 5pm", "until noon"
+  result = result.replace(/\buntil\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.?|p\.m\.?)?/gi, '');
+  result = result.replace(/\buntil\s+(?:noon|midnight)\b/gi, '');
+
+  // Clean up leftover connecting words at start/end
+  // Remove leading: DUE, on, at, from, to, starting, ending, begins, ends
+  result = result.replace(/^[\s,\-:]*\b(DUE|on|at|from|to|starting|ending|begins|ends|by)\b[\s,\-:]*/gi, '');
+
+  // Remove trailing: on, at, from, to, DUE
+  result = result.replace(/[\s,\-:]*\b(on|at|from|to|DUE)\b[\s,\-:]*$/gi, '');
+
+  // Clean up multiple spaces
+  result = result.replace(/\s+/g, ' ');
+
+  // Clean up punctuation left over (leading/trailing commas, colons, dashes, parentheses)
+  result = result.replace(/^[\s,\-–:()]+/, '');
+  result = result.replace(/[\s,\-–:()]+$/, '');
+
+  // One more pass for connecting words that might now be at edges
+  result = result.replace(/^[\s,\-:]*\b(DUE|on|at|from|to)\b[\s,\-:]*/gi, '');
+  result = result.replace(/[\s,\-:]*\b(on|at|from|to|DUE)\b[\s,\-:]*$/gi, '');
+
+  return result.trim();
+}
+
+/**
  * Extract a suitable title from the text
  */
 function extractTitle(text) {
-  // Clean up whitespace
+  // Clean up whitespace first
   const cleaned = text.replace(/\s+/g, ' ').trim();
 
+  // Try to clean date/time from the title
+  const titleWithoutDateTime = cleanTitle(cleaned);
+
+  // Use cleaned title if it has meaningful content (at least 3 chars)
+  // Otherwise fall back to original text
+  const finalTitle = titleWithoutDateTime.length >= 3 ? titleWithoutDateTime : cleaned;
+
   // If text is short enough, use it all
-  if (cleaned.length <= 60) {
-    return cleaned;
+  if (finalTitle.length <= 60) {
+    return finalTitle;
   }
 
   // Try to get the first sentence
-  const sentenceMatch = cleaned.match(/^[^.!?]+[.!?]?/);
+  const sentenceMatch = finalTitle.match(/^[^.!?]+[.!?]?/);
   if (sentenceMatch && sentenceMatch[0].length <= 100) {
     return sentenceMatch[0].trim();
   }
 
   // Truncate to 60 chars at a word boundary
-  const truncated = cleaned.substring(0, 60);
+  const truncated = finalTitle.substring(0, 60);
   const lastSpace = truncated.lastIndexOf(' ');
   if (lastSpace > 30) {
     return truncated.substring(0, lastSpace) + '...';
