@@ -45,29 +45,38 @@ document.addEventListener('DOMContentLoaded', () => {
    * Load recent events using message API
    */
   async function loadRecentEvents() {
+    console.log('=== loadRecentEvents START ===');
     try {
+      console.log('Sending getRecentEvents message to background...');
       const response = await chrome.runtime.sendMessage({
         action: 'getRecentEvents',
         limit: 5
       });
+      console.log('Response from background:', JSON.stringify(response, null, 2));
 
       if (response.success) {
+        console.log('Events received:', response.events.length);
         renderEvents(response.events);
       } else {
         console.error('Failed to load events:', response.error);
         renderEvents([]);
       }
     } catch (error) {
-      console.error('Error loading events:', error);
+      console.error('Error loading events via message:', error);
+      console.log('Falling back to direct storage access...');
       // Fallback to direct storage access if message fails
       try {
         const result = await chrome.storage.local.get(['recentEvents']);
-        renderEvents(result.recentEvents || []);
+        console.log('Direct storage result:', JSON.stringify(result, null, 2));
+        const events = result.recentEvents || [];
+        console.log('Events from direct storage:', events.length);
+        renderEvents(events);
       } catch (fallbackError) {
         console.error('Fallback also failed:', fallbackError);
         renderEvents([]);
       }
     }
+    console.log('=== loadRecentEvents END ===');
   }
 
   /**

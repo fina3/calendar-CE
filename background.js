@@ -82,6 +82,8 @@ const EventStorage = {
    * @returns {Promise<Object>} - The saved event record
    */
   async saveEvent(eventData, calendarUrl, originalText) {
+    console.log('=== EventStorage.saveEvent START ===');
+    console.log('Input eventData:', JSON.stringify(eventData, null, 2));
     try {
       const eventRecord = {
         id: this.generateId(),
@@ -93,9 +95,12 @@ const EventStorage = {
         originalText: originalText,
         confidence: eventData.confidence || 0
       };
+      console.log('Created eventRecord:', JSON.stringify(eventRecord, null, 2));
 
       const result = await chrome.storage.local.get([CONFIG.STORAGE_KEY]);
+      console.log('Current storage result:', JSON.stringify(result, null, 2));
       let events = result[CONFIG.STORAGE_KEY] || [];
+      console.log('Current events count:', events.length);
 
       // Add new event at the beginning
       events.unshift(eventRecord);
@@ -106,11 +111,21 @@ const EventStorage = {
         log(`Trimmed history to ${CONFIG.MAX_EVENTS} events`);
       }
 
+      console.log('About to save. Events count:', events.length);
       await chrome.storage.local.set({ [CONFIG.STORAGE_KEY]: events });
-      log(`Event saved. ID: ${eventRecord.id}, Total: ${events.length}`);
+      console.log('chrome.storage.local.set() completed');
+
+      // Verify the save worked
+      const verifyResult = await chrome.storage.local.get([CONFIG.STORAGE_KEY]);
+      console.log('VERIFY after save:', JSON.stringify(verifyResult, null, 2));
+      console.log('=== EventStorage.saveEvent END ===');
 
       return eventRecord;
     } catch (error) {
+      console.error('=== EventStorage.saveEvent FAILED ===');
+      console.error('Error:', error);
+      console.error('Error message:', error.message);
+      console.error('Error stack:', error.stack);
       logError('Error saving event:', error);
       throw error;
     }
@@ -122,11 +137,20 @@ const EventStorage = {
    * @returns {Promise<Array>} - Array of event records
    */
   async getRecentEvents(limit = 5) {
+    console.log('=== getRecentEvents START ===');
+    console.log('Requested limit:', limit);
     try {
       const result = await chrome.storage.local.get([CONFIG.STORAGE_KEY]);
+      console.log('Storage key used:', CONFIG.STORAGE_KEY);
+      console.log('Raw storage result:', JSON.stringify(result, null, 2));
       const events = result[CONFIG.STORAGE_KEY] || [];
+      console.log('Events found:', events.length);
+      console.log('Returning:', events.slice(0, limit).length, 'events');
+      console.log('=== getRecentEvents END ===');
       return events.slice(0, limit);
     } catch (error) {
+      console.error('=== getRecentEvents FAILED ===');
+      console.error('Error:', error);
       logError('Error getting recent events:', error);
       return [];
     }
@@ -156,6 +180,9 @@ const EventStorage = {
     try {
       await chrome.storage.local.set({ [CONFIG.STORAGE_KEY]: [] });
       log('Event history cleared');
+      // Reset session count and badge when history is cleared
+      sessionEventCount = 0;
+      updateBadge();
     } catch (error) {
       logError('Error clearing history:', error);
       throw error;
@@ -178,6 +205,11 @@ const EventStorage = {
       if (events.length < initialLength) {
         await chrome.storage.local.set({ [CONFIG.STORAGE_KEY]: events });
         log(`Event deleted. ID: ${id}`);
+        // Decrement session count and update badge
+        if (sessionEventCount > 0) {
+          sessionEventCount--;
+          updateBadge();
+        }
         return true;
       }
 
@@ -266,7 +298,12 @@ chrome.runtime.onInstalled.addListener(async () => {
 
 // Handle context menu click
 chrome.contextMenus.onClicked.addListener(async (info, _tab) => {
+  console.log('=== CONTEXT MENU CLICKED ===');
+  console.log('menuItemId:', info.menuItemId);
+  console.log('selectionText:', info.selectionText);
+
   if (info.menuItemId !== 'createCalendarEvent' || !info.selectionText) {
+    console.log('Early return - wrong menu or no selection');
     return;
   }
 
@@ -277,23 +314,30 @@ chrome.contextMenus.onClicked.addListener(async (info, _tab) => {
     return;
   }
 
-  log('Selected text:', selectedText);
+  console.log('Selected text:', selectedText);
 
   try {
     // Parse the text and create calendar URL
     const eventData = parseEventFromText(selectedText);
-    log('Parsed event data:', eventData);
+    console.log('Parsed event data:', JSON.stringify(eventData, (key, value) => {
+      if (value instanceof Date) return value.toISOString();
+      return value;
+    }, 2));
 
     const calendarUrl = createGoogleCalendarUrl(eventData);
-    log('Calendar URL created');
+    console.log('Calendar URL:', calendarUrl);
 
     // Open the calendar link
     await chrome.tabs.create({ url: calendarUrl });
+    console.log('Calendar tab opened');
 
     // Save to event history
     try {
-      await EventStorage.saveEvent(eventData, calendarUrl, selectedText);
+      console.log('Attempting to save event...');
+      const saved = await EventStorage.saveEvent(eventData, calendarUrl, selectedText);
+      console.log('Event saved successfully:', JSON.stringify(saved, null, 2));
       incrementSessionCount();
+      console.log('Session count incremented to:', sessionEventCount);
 
       // Show success notification
       await showNotification(
@@ -301,14 +345,21 @@ chrome.contextMenus.onClicked.addListener(async (info, _tab) => {
         `"${eventData.title}" - ${formatDateForDisplay(eventData.startDate)}`
       );
     } catch (saveError) {
+      console.error('=== SAVE FAILED ===');
+      console.error('Error:', saveError);
+      console.error('Error message:', saveError.message);
+      console.error('Error stack:', saveError.stack);
       logError('Failed to save event to history:', saveError);
       // Don't block the user - calendar link is already open
     }
   } catch (error) {
+    console.error('=== CONTEXT MENU HANDLER FAILED ===');
+    console.error('Error:', error);
     logError('Error creating calendar event:', error);
     // Try to show an error notification
     await showNotification('Error', 'Failed to create calendar event. Please try again.');
   }
+  console.log('=== CONTEXT MENU HANDLER END ===');
 });
 
 /**
@@ -333,16 +384,27 @@ function formatDateForDisplay(date) {
 // =============================================================================
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  console.log('=== MESSAGE RECEIVED ===');
+  console.log('Message:', JSON.stringify(message, null, 2));
+  console.log('Sender:', sender.id);
   handleMessage(message)
-    .then(response => sendResponse(response))
-    .catch(error => sendResponse({ success: false, error: error.message }));
+    .then(response => {
+      console.log('Sending response:', JSON.stringify(response, null, 2));
+      sendResponse(response);
+    })
+    .catch(error => {
+      console.error('Message handler error:', error);
+      sendResponse({ success: false, error: error.message });
+    });
   return true; // Keep channel open for async response
 });
 
 async function handleMessage(message) {
   switch (message.action) {
   case 'getRecentEvents':
+    console.log('Handling getRecentEvents action...');
     const events = await EventStorage.getRecentEvents(message.limit || 5);
+    console.log('getRecentEvents returning', events.length, 'events');
     return { success: true, events };
 
   case 'clearHistory':
