@@ -602,23 +602,28 @@ function calculateConfidence(parsed, text) {
  * @returns {string} - Text with date/time patterns removed
  */
 function cleanTitle(text) {
-  let result = text;
+  // First, convert newlines to spaces
+  let result = text.replace(/\n/g, ' ');
 
-  // Day names (with optional DUE prefix)
+  // Full day names (with optional DUE prefix)
   result = result.replace(/\b(DUE\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b,?/gi, '');
+
+  // Abbreviated day names: Mon, Tue, Wed, Thu, Fri, Sat, Sun
+  result = result.replace(/\b(mon|tue|wed|thu|fri|sat|sun)\b,?\s*/gi, '');
 
   // Relative dates
   result = result.replace(/\b(today|tomorrow|day after tomorrow|next\s+week|this\s+week)\b/gi, '');
 
-  // Time ranges: "6-8pm", "9am-5pm", "10:00am-2:00pm"
-  result = result.replace(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.?|p\.m\.?)?\s*[-–to]+\s*\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.?|p\.m\.?)\b/gi, '');
+  // Time ranges with single-letter or full meridiem: "8:00A - 11:00A", "6-8pm", "9am-5pm"
+  // Handles hyphen (-), en-dash (–), em-dash (—), and "to"
+  result = result.replace(/\b\d{1,2}(?::\d{2})?\s*(?:a\.?m?\.?|p\.?m?\.?)?\s*(?:-|–|—|to)\s*\d{1,2}(?::\d{2})?\s*(?:a\.?m?\.?|p\.?m?\.?)\b/gi, '');
 
-  // Times with "at": "at 3pm", "at 11:59 PM", "at noon", "at midnight"
-  result = result.replace(/\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.?|p\.m\.?)?/gi, '');
+  // Times with "at": "at 3pm", "at 11:59 PM", "at noon", "at midnight", "at 3P"
+  result = result.replace(/\bat\s+\d{1,2}(?::\d{2})?\s*(?:a\.?m?\.?|p\.?m?\.?)?/gi, '');
   result = result.replace(/\bat\s+(?:noon|midnight)\b/gi, '');
 
-  // Standalone times: "3pm", "11:59 PM", "3:00 pm"
-  result = result.replace(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.?|p\.m\.?)\b/gi, '');
+  // Standalone times with single-letter meridiem: "8:00A", "11:00A", "3P", "3:00 pm"
+  result = result.replace(/\b\d{1,2}(?::\d{2})?\s*(?:a\.?m?\.?|p\.?m?\.?)\b/gi, '');
 
   // Time of day words: "morning", "afternoon", "evening", "night"
   result = result.replace(/\b(?:in\s+the\s+)?(?:morning|afternoon|evening|night)\b/gi, '');
@@ -640,26 +645,26 @@ function cleanTitle(text) {
   result = result.replace(/\bfor\s+(?:an?\s+)?(?:\d+(?:\.\d+)?\s*)?(?:hours?|hrs?|minutes?|mins?|half\s+(?:an?\s+)?hour)\b/gi, '');
 
   // "until" phrases: "until 5pm", "until noon"
-  result = result.replace(/\buntil\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.?|p\.m\.?)?/gi, '');
+  result = result.replace(/\buntil\s+\d{1,2}(?::\d{2})?\s*(?:a\.?m?\.?|p\.?m?\.?)?/gi, '');
   result = result.replace(/\buntil\s+(?:noon|midnight)\b/gi, '');
 
   // Clean up leftover connecting words at start/end
   // Remove leading: DUE, on, at, from, to, starting, ending, begins, ends
-  result = result.replace(/^[\s,\-:]*\b(DUE|on|at|from|to|starting|ending|begins|ends|by)\b[\s,\-:]*/gi, '');
+  result = result.replace(/^[\s,\-–—:]*\b(DUE|on|at|from|to|starting|ending|begins|ends|by)\b[\s,\-–—:]*/gi, '');
 
   // Remove trailing: on, at, from, to, DUE
-  result = result.replace(/[\s,\-:]*\b(on|at|from|to|DUE)\b[\s,\-:]*$/gi, '');
+  result = result.replace(/[\s,\-–—:]*\b(on|at|from|to|DUE)\b[\s,\-–—:]*$/gi, '');
 
   // Clean up multiple spaces
   result = result.replace(/\s+/g, ' ');
 
   // Clean up punctuation left over (leading/trailing commas, colons, dashes, parentheses)
-  result = result.replace(/^[\s,\-–:()]+/, '');
-  result = result.replace(/[\s,\-–:()]+$/, '');
+  result = result.replace(/^[\s,\-–—:()]+/, '');
+  result = result.replace(/[\s,\-–—:()]+$/, '');
 
   // One more pass for connecting words that might now be at edges
-  result = result.replace(/^[\s,\-:]*\b(DUE|on|at|from|to)\b[\s,\-:]*/gi, '');
-  result = result.replace(/[\s,\-:]*\b(on|at|from|to|DUE)\b[\s,\-:]*$/gi, '');
+  result = result.replace(/^[\s,\-–—:]*\b(DUE|on|at|from|to)\b[\s,\-–—:]*/gi, '');
+  result = result.replace(/[\s,\-–—:]*\b(on|at|from|to|DUE)\b[\s,\-–—:]*$/gi, '');
 
   return result.trim();
 }
@@ -989,10 +994,13 @@ function extractTimeRange(text) {
   // Pattern 4: "6:00pm-8:00pm" (with minutes, meridiem on both)
   // Pattern 5: "6pm to 8pm", "6 to 8pm" (using "to" instead of dash)
   // Pattern 6: "10am-2pm" (different meridiems - crosses noon)
+  // Pattern 7: "8:00A - 11:00A" (single letter meridiem)
+  // Pattern 8: "8A - 11A" (single letter, no minutes)
 
   // Comprehensive regex that handles all patterns
+  // Meridiem pattern matches: am, AM, a.m., A.M., a, A, pm, PM, p.m., P.M., p, P
   // Groups: 1=startHour, 2=startMin, 3=startMeridiem, 4=endHour, 5=endMin, 6=endMeridiem
-  const timeRangeRegex = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.?|p\.m\.?)?\s*(?:-|–|to)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.?|p\.m\.?)\b/i;
+  const timeRangeRegex = /\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m?\.?|p\.?m?\.?)?\s*(?:-|–|—|to)\s*(\d{1,2})(?::(\d{2}))?\s*(a\.?m?\.?|p\.?m?\.?)\b/i;
 
   const match = text.match(timeRangeRegex);
 
@@ -1118,8 +1126,9 @@ function extractTime(text) {
     return { found: true, hours: 20, minutes: 0, type: 'night' };
   }
 
-  // 3. 12-hour format: 3pm, 3:00pm, 3:00 PM, 3 pm, 3:30 a.m.
-  const time12Regex = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm|a\.m\.?|p\.m\.?)\b/i;
+  // 3. 12-hour format: 3pm, 3:00pm, 3:00 PM, 3 pm, 3:30 a.m., 3P, 3:00A
+  // Meridiem pattern matches: am, AM, a.m., A.M., a, A, pm, PM, p.m., P.M., p, P
+  const time12Regex = /\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m?\.?|p\.?m?\.?)\b/i;
   const time12Match = text.match(time12Regex);
   if (time12Match) {
     let hours = parseInt(time12Match[1], 10);
