@@ -341,7 +341,7 @@ h2 {
 }
 
 .event-card {
-  animation: fadeIn 0.2s ease-out;
+  animation: fadeIn 0.2s ease-out both;
 }
 
 .event-card.removing {

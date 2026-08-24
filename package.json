@@ -6,8 +6,9 @@
   "scripts": {
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
+    "test": "node scripts/test-parse.js",
     "build": "node scripts/build.js",
-    "prebuild": "npm run lint"
+    "prebuild": "npm run lint && npm test"
   },
   "devDependencies": {
     "eslint": "^8.57.0"

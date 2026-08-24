@@ -8,11 +8,37 @@ const CONFIG = {
   DEBUG: false, // Set to true to enable detailed logging
   MAX_EVENTS: 20,
   STORAGE_KEY: 'recentEvents',
-  DEFAULT_DURATION_MS: 60 * 60 * 1000 // 1 hour
+  SESSION_COUNT_KEY: 'sessionEventCount',
+  DEFAULT_DURATION_MS: 60 * 60 * 1000, // 1 hour
+  MAX_TITLE_LENGTH: 250,
+  MAX_DETAILS_LENGTH: 1000,
+  MAX_ORIGINAL_TEXT_LENGTH: 500,
+  NOTIFICATION_ID: 'text-to-calendar-status'
 };
 
+const CONTEXT_MENU_ID = 'createCalendarEvent';
+
 /**
- * Debug logger - only logs when DEBUG is enabled
+ * Meridiem forms we accept: "am", "AM", "a.m.", "pm", "p.m." and the single
+ * letter form used by course catalogues ("8:00A", "3P").
+ *
+ * Kept as one self-contained group so that `${MERIDIEM}?` makes the whole
+ * meridiem optional rather than just its lookahead.
+ *
+ * The trailing lookahead is what keeps the single letter form honest: without
+ * it "pages 3-5 p. 20" parses as 3pm-5pm and "meet at 5 apples" swallows the
+ * leading "a". Used with the `i` flag, so [a-z] covers both cases.
+ */
+const MERIDIEM = '(?:(?:[ap]\\.?m\\.?|[ap])(?![.a-z]))';
+
+/**
+ * A clock hour, 1-12. Keeps "CS 61A" and "Room 7A" from being read as times.
+ */
+const HOUR_12 = '(?:1[0-2]|0?[1-9])';
+
+/**
+ * Debug logger - only logs when DEBUG is enabled.
+ * Selected text is user content, so it must never be logged unconditionally.
  */
 function log(...args) {
   if (CONFIG.DEBUG) {
@@ -27,11 +53,73 @@ function logError(...args) {
   console.error('Text to Calendar Error:', ...args);
 }
 
+/**
+ * Truncate a string to a maximum length, keeping storage and generated URLs
+ * bounded no matter how much text was selected.
+ */
+function truncate(text, maxLength) {
+  if (typeof text !== 'string') {
+    return '';
+  }
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}\u2026` : text;
+}
+
+/**
+ * Escape a string for literal use inside a RegExp
+ */
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // =============================================================================
-// SESSION STATE (resets when browser closes)
+// SESSION STATE (resets when the browser closes)
 // =============================================================================
 
+// MV3 service workers are torn down after ~30s idle, so an in-memory counter
+// silently resets and the badge disappears. Mirror it into chrome.storage.session
+// (cleared automatically when the browser closes) and restore it on every start.
 let sessionEventCount = 0;
+let sessionCountLoad = null;
+
+function sessionArea() {
+  return (chrome.storage && chrome.storage.session) || chrome.storage.local;
+}
+
+async function loadSessionCount() {
+  if (!sessionCountLoad) {
+    sessionCountLoad = sessionArea().get([CONFIG.SESSION_COUNT_KEY])
+      .then((result) => {
+        const stored = result[CONFIG.SESSION_COUNT_KEY];
+        sessionEventCount = Number.isInteger(stored) && stored > 0 ? stored : 0;
+        return sessionEventCount;
+      })
+      .catch((error) => {
+        logError('Could not restore session count:', error);
+        return sessionEventCount;
+      });
+  }
+  return sessionCountLoad;
+}
+
+async function setSessionCount(count) {
+  sessionEventCount = Math.max(0, count);
+  sessionCountLoad = Promise.resolve(sessionEventCount);
+  try {
+    await sessionArea().set({ [CONFIG.SESSION_COUNT_KEY]: sessionEventCount });
+  } catch (error) {
+    logError('Could not persist session count:', error);
+  }
+  await updateBadge();
+}
+
+/**
+ * Restore the badge after the service worker has been restarted
+ */
+function restoreSessionState() {
+  loadSessionCount()
+    .then(updateBadge)
+    .catch((error) => logError('Could not restore badge:', error));
+}
 
 // =============================================================================
 // NOTIFICATION SYSTEM
@@ -39,23 +127,25 @@ let sessionEventCount = 0;
 
 /**
  * Show a notification to the user
- * Falls back to console log if notifications aren't available
+ *
+ * Always reuses a single notification id: creating anonymous notifications
+ * leaves one entry per event piling up in the notification centre.
  */
 async function showNotification(title, message) {
   try {
-    // Check if we have notification permission
-    if (chrome.notifications) {
-      await chrome.notifications.create({
-        type: 'basic',
-        iconUrl: 'icons/icon48.png',
-        title: title,
-        message: message,
-        silent: true
-      });
-      log('Notification shown:', title);
-    } else {
-      log('Notifications not available, message:', title, message);
+    if (!chrome.notifications) {
+      log('Notifications not available:', title, message);
+      return;
     }
+    await chrome.notifications.clear(CONFIG.NOTIFICATION_ID);
+    await chrome.notifications.create(CONFIG.NOTIFICATION_ID, {
+      type: 'basic',
+      iconUrl: 'icons/icon48.png',
+      title: title,
+      message: message,
+      silent: true
+    });
+    log('Notification shown:', title);
   } catch (error) {
     // Notifications might not be available - that's okay
     log('Could not show notification:', error.message);
@@ -66,12 +156,43 @@ async function showNotification(title, message) {
 // STORAGE UTILITY
 // =============================================================================
 
+// Every mutation is a read-modify-write cycle. Two events created in quick
+// succession would otherwise read the same snapshot and the second write would
+// drop the first event.
+let storageQueue = Promise.resolve();
+
+function withStorageLock(task) {
+  const run = storageQueue.then(task, task);
+  storageQueue = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+/**
+ * Drop anything that is not a usable event record (corrupt or partially
+ * written history should not break the popup).
+ */
+function sanitizeEvents(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((event) => event && typeof event === 'object' && typeof event.id === 'string');
+}
+
 const EventStorage = {
   /**
    * Generate a unique ID for an event
    */
   generateId() {
     return `evt_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+  },
+
+  /**
+   * Read the stored history, dropping any corrupt entries
+   * @returns {Promise<Array>}
+   */
+  async readAll() {
+    const result = await chrome.storage.local.get([CONFIG.STORAGE_KEY]);
+    return sanitizeEvents(result[CONFIG.STORAGE_KEY]);
   },
 
   /**
@@ -82,53 +203,35 @@ const EventStorage = {
    * @returns {Promise<Object>} - The saved event record
    */
   async saveEvent(eventData, calendarUrl, originalText) {
-    console.log('=== EventStorage.saveEvent START ===');
-    console.log('Input eventData:', JSON.stringify(eventData, null, 2));
-    try {
-      const eventRecord = {
-        id: this.generateId(),
-        title: eventData.title,
-        startDate: eventData.startDate.toISOString(),
-        endDate: eventData.endDate.toISOString(),
-        calendarUrl: calendarUrl,
-        createdAt: new Date().toISOString(),
-        originalText: originalText,
-        confidence: eventData.confidence || 0
-      };
-      console.log('Created eventRecord:', JSON.stringify(eventRecord, null, 2));
+    return withStorageLock(async () => {
+      try {
+        const eventRecord = {
+          id: this.generateId(),
+          title: eventData.title,
+          startDate: eventData.startDate.toISOString(),
+          endDate: eventData.endDate.toISOString(),
+          calendarUrl: calendarUrl,
+          createdAt: new Date().toISOString(),
+          originalText: truncate(originalText, CONFIG.MAX_ORIGINAL_TEXT_LENGTH),
+          confidence: eventData.confidence || 0
+        };
 
-      const result = await chrome.storage.local.get([CONFIG.STORAGE_KEY]);
-      console.log('Current storage result:', JSON.stringify(result, null, 2));
-      let events = result[CONFIG.STORAGE_KEY] || [];
-      console.log('Current events count:', events.length);
+        let events = await this.readAll();
+        events.unshift(eventRecord);
 
-      // Add new event at the beginning
-      events.unshift(eventRecord);
+        // Keep only the maximum allowed events
+        if (events.length > CONFIG.MAX_EVENTS) {
+          events = events.slice(0, CONFIG.MAX_EVENTS);
+        }
 
-      // Keep only the maximum allowed events
-      if (events.length > CONFIG.MAX_EVENTS) {
-        events = events.slice(0, CONFIG.MAX_EVENTS);
-        log(`Trimmed history to ${CONFIG.MAX_EVENTS} events`);
+        await chrome.storage.local.set({ [CONFIG.STORAGE_KEY]: events });
+        log('Event saved:', eventRecord.id);
+        return eventRecord;
+      } catch (error) {
+        logError('Error saving event:', error);
+        throw error;
       }
-
-      console.log('About to save. Events count:', events.length);
-      await chrome.storage.local.set({ [CONFIG.STORAGE_KEY]: events });
-      console.log('chrome.storage.local.set() completed');
-
-      // Verify the save worked
-      const verifyResult = await chrome.storage.local.get([CONFIG.STORAGE_KEY]);
-      console.log('VERIFY after save:', JSON.stringify(verifyResult, null, 2));
-      console.log('=== EventStorage.saveEvent END ===');
-
-      return eventRecord;
-    } catch (error) {
-      console.error('=== EventStorage.saveEvent FAILED ===');
-      console.error('Error:', error);
-      console.error('Error message:', error.message);
-      console.error('Error stack:', error.stack);
-      logError('Error saving event:', error);
-      throw error;
-    }
+    });
   },
 
   /**
@@ -136,21 +239,14 @@ const EventStorage = {
    * @param {number} limit - Maximum number of events to return (default: 5)
    * @returns {Promise<Array>} - Array of event records
    */
-  async getRecentEvents(limit = 5) {
-    console.log('=== getRecentEvents START ===');
-    console.log('Requested limit:', limit);
+  async getRecentEvents(limit) {
+    const max = Number.isInteger(limit) && limit > 0
+      ? Math.min(limit, CONFIG.MAX_EVENTS)
+      : 5;
     try {
-      const result = await chrome.storage.local.get([CONFIG.STORAGE_KEY]);
-      console.log('Storage key used:', CONFIG.STORAGE_KEY);
-      console.log('Raw storage result:', JSON.stringify(result, null, 2));
-      const events = result[CONFIG.STORAGE_KEY] || [];
-      console.log('Events found:', events.length);
-      console.log('Returning:', events.slice(0, limit).length, 'events');
-      console.log('=== getRecentEvents END ===');
-      return events.slice(0, limit);
+      const events = await this.readAll();
+      return events.slice(0, max);
     } catch (error) {
-      console.error('=== getRecentEvents FAILED ===');
-      console.error('Error:', error);
       logError('Error getting recent events:', error);
       return [];
     }
@@ -163,9 +259,8 @@ const EventStorage = {
    */
   async getEvent(id) {
     try {
-      const result = await chrome.storage.local.get([CONFIG.STORAGE_KEY]);
-      const events = result[CONFIG.STORAGE_KEY] || [];
-      return events.find(event => event.id === id) || null;
+      const events = await this.readAll();
+      return events.find((event) => event.id === id) || null;
     } catch (error) {
       logError('Error getting event:', error);
       return null;
@@ -177,16 +272,16 @@ const EventStorage = {
    * @returns {Promise<void>}
    */
   async clearHistory() {
-    try {
-      await chrome.storage.local.set({ [CONFIG.STORAGE_KEY]: [] });
-      log('Event history cleared');
-      // Reset session count and badge when history is cleared
-      sessionEventCount = 0;
-      updateBadge();
-    } catch (error) {
-      logError('Error clearing history:', error);
-      throw error;
-    }
+    return withStorageLock(async () => {
+      try {
+        await chrome.storage.local.set({ [CONFIG.STORAGE_KEY]: [] });
+        log('Event history cleared');
+        await setSessionCount(0);
+      } catch (error) {
+        logError('Error clearing history:', error);
+        throw error;
+      }
+    });
   },
 
   /**
@@ -195,29 +290,28 @@ const EventStorage = {
    * @returns {Promise<boolean>} - True if deleted, false if not found
    */
   async deleteEvent(id) {
-    try {
-      const result = await chrome.storage.local.get([CONFIG.STORAGE_KEY]);
-      let events = result[CONFIG.STORAGE_KEY] || [];
-      const initialLength = events.length;
+    return withStorageLock(async () => {
+      try {
+        const events = await this.readAll();
+        const remaining = events.filter((event) => event.id !== id);
 
-      events = events.filter(event => event.id !== id);
+        if (remaining.length === events.length) {
+          return false;
+        }
 
-      if (events.length < initialLength) {
-        await chrome.storage.local.set({ [CONFIG.STORAGE_KEY]: events });
-        log(`Event deleted. ID: ${id}`);
-        // Decrement session count and update badge
+        await chrome.storage.local.set({ [CONFIG.STORAGE_KEY]: remaining });
+        log('Event deleted:', id);
+
+        await loadSessionCount();
         if (sessionEventCount > 0) {
-          sessionEventCount--;
-          updateBadge();
+          await setSessionCount(sessionEventCount - 1);
         }
         return true;
+      } catch (error) {
+        logError('Error deleting event:', error);
+        return false;
       }
-
-      return false;
-    } catch (error) {
-      logError('Error deleting event:', error);
-      return false;
-    }
+    });
   },
 
   /**
@@ -226,8 +320,7 @@ const EventStorage = {
    */
   async getEventCount() {
     try {
-      const result = await chrome.storage.local.get([CONFIG.STORAGE_KEY]);
-      const events = result[CONFIG.STORAGE_KEY] || [];
+      const events = await this.readAll();
       return events.length;
     } catch (error) {
       logError('Error getting event count:', error);
@@ -241,10 +334,9 @@ const EventStorage = {
 // =============================================================================
 
 /**
- * Update the extension badge with session event count
+ * Update the extension badge with the session event count
  */
-function updateBadge() {
-  // Don't run if service worker APIs aren't ready
+async function updateBadge() {
   if (typeof chrome === 'undefined' || !chrome.action) {
     return;
   }
@@ -252,22 +344,23 @@ function updateBadge() {
   try {
     if (sessionEventCount > 0) {
       const text = sessionEventCount > 99 ? '99+' : String(sessionEventCount);
-      chrome.action.setBadgeText({ text });
-      chrome.action.setBadgeBackgroundColor({ color: '#4285f4' });
+      await chrome.action.setBadgeText({ text });
+      await chrome.action.setBadgeBackgroundColor({ color: '#4285f4' });
     } else {
-      chrome.action.setBadgeText({ text: '' });
+      await chrome.action.setBadgeText({ text: '' });
     }
   } catch (error) {
-    // Silently ignore - badge is not critical functionality
+    // The badge is cosmetic - never let it break event creation
+    log('Could not update badge:', error.message);
   }
 }
 
 /**
  * Increment session event count and update badge
  */
-function incrementSessionCount() {
-  sessionEventCount++;
-  updateBadge();
+async function incrementSessionCount() {
+  await loadSessionCount();
+  await setSessionCount(sessionEventCount + 1);
   log(`Session count: ${sessionEventCount}`);
 }
 
@@ -275,91 +368,86 @@ function incrementSessionCount() {
 // EXTENSION LIFECYCLE
 // =============================================================================
 
-// Create context menu item when extension is installed
-chrome.runtime.onInstalled.addListener(async () => {
+/**
+ * (Re)create the context menu item.
+ *
+ * removeAll() first: on an update the previous item still exists and create()
+ * would fail with a duplicate id, leaving an unchecked runtime.lastError.
+ */
+async function ensureContextMenu() {
   try {
-    await chrome.contextMenus.create({
-      id: 'createCalendarEvent',
-      title: '📅 Create Calendar Event',
+    await chrome.contextMenus.removeAll();
+    chrome.contextMenus.create({
+      id: CONTEXT_MENU_ID,
+      title: '\u{1F4C5} Create Calendar Event',
       contexts: ['selection']
+    }, () => {
+      // create() reports failures through lastError, not by throwing
+      if (chrome.runtime.lastError) {
+        logError('Error creating context menu:', chrome.runtime.lastError.message);
+      } else {
+        log('Context menu created');
+      }
     });
-    log('Context menu created');
   } catch (error) {
-    logError('Error creating context menu:', error);
+    logError('Error resetting context menus:', error);
   }
+}
 
-  // Clear badge on install/update
-  updateBadge();
+chrome.runtime.onInstalled.addListener(() => {
+  ensureContextMenu();
+  restoreSessionState();
 });
+
+chrome.runtime.onStartup.addListener(() => {
+  ensureContextMenu();
+  // A new browser session starts with a clean count
+  setSessionCount(0);
+});
+
+// The service worker is evicted whenever it goes idle; restore the badge every
+// time it spins back up so the count survives eviction.
+restoreSessionState();
 
 // =============================================================================
 // CONTEXT MENU HANDLER
 // =============================================================================
 
-// Handle context menu click
 chrome.contextMenus.onClicked.addListener(async (info, _tab) => {
-  console.log('=== CONTEXT MENU CLICKED ===');
-  console.log('menuItemId:', info.menuItemId);
-  console.log('selectionText:', info.selectionText);
-
-  if (info.menuItemId !== 'createCalendarEvent' || !info.selectionText) {
-    console.log('Early return - wrong menu or no selection');
+  if (info.menuItemId !== CONTEXT_MENU_ID || !info.selectionText) {
     return;
   }
 
   const selectedText = info.selectionText.trim();
-
   if (!selectedText) {
-    logError('No text selected');
     return;
   }
 
-  console.log('Selected text:', selectedText);
+  let eventData;
+  let calendarUrl;
 
   try {
-    // Parse the text and create calendar URL
-    const eventData = parseEventFromText(selectedText);
-    console.log('Parsed event data:', JSON.stringify(eventData, (key, value) => {
-      if (value instanceof Date) return value.toISOString();
-      return value;
-    }, 2));
-
-    const calendarUrl = createGoogleCalendarUrl(eventData);
-    console.log('Calendar URL:', calendarUrl);
-
-    // Open the calendar link
+    eventData = parseEventFromText(selectedText);
+    calendarUrl = createGoogleCalendarUrl(eventData);
     await chrome.tabs.create({ url: calendarUrl });
-    console.log('Calendar tab opened');
-
-    // Save to event history
-    try {
-      console.log('Attempting to save event...');
-      const saved = await EventStorage.saveEvent(eventData, calendarUrl, selectedText);
-      console.log('Event saved successfully:', JSON.stringify(saved, null, 2));
-      incrementSessionCount();
-      console.log('Session count incremented to:', sessionEventCount);
-
-      // Show success notification
-      await showNotification(
-        'Event Created!',
-        `"${eventData.title}" - ${formatDateForDisplay(eventData.startDate)}`
-      );
-    } catch (saveError) {
-      console.error('=== SAVE FAILED ===');
-      console.error('Error:', saveError);
-      console.error('Error message:', saveError.message);
-      console.error('Error stack:', saveError.stack);
-      logError('Failed to save event to history:', saveError);
-      // Don't block the user - calendar link is already open
-    }
   } catch (error) {
-    console.error('=== CONTEXT MENU HANDLER FAILED ===');
-    console.error('Error:', error);
     logError('Error creating calendar event:', error);
-    // Try to show an error notification
     await showNotification('Error', 'Failed to create calendar event. Please try again.');
+    return;
   }
-  console.log('=== CONTEXT MENU HANDLER END ===');
+
+  // The calendar tab is already open - a history failure must not be reported
+  // to the user as a failure to create the event.
+  try {
+    await EventStorage.saveEvent(eventData, calendarUrl, selectedText);
+    await incrementSessionCount();
+    await showNotification(
+      'Event Created!',
+      `"${eventData.title}" - ${formatDateForDisplay(eventData.startDate)}`
+    );
+  } catch (saveError) {
+    logError('Failed to save event to history:', saveError);
+  }
 });
 
 /**
@@ -384,43 +472,52 @@ function formatDateForDisplay(date) {
 // =============================================================================
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  console.log('=== MESSAGE RECEIVED ===');
-  console.log('Message:', JSON.stringify(message, null, 2));
-  console.log('Sender:', sender.id);
+  // Only this extension's own pages may drive the storage API
+  if (!sender || sender.id !== chrome.runtime.id) {
+    sendResponse({ success: false, error: 'Unauthorized sender' });
+    return false;
+  }
+
   handleMessage(message)
-    .then(response => {
-      console.log('Sending response:', JSON.stringify(response, null, 2));
-      sendResponse(response);
-    })
-    .catch(error => {
-      console.error('Message handler error:', error);
+    .then(sendResponse)
+    .catch((error) => {
+      logError('Message handler error:', error);
       sendResponse({ success: false, error: error.message });
     });
+
   return true; // Keep channel open for async response
 });
 
 async function handleMessage(message) {
-  switch (message.action) {
-  case 'getRecentEvents':
-    console.log('Handling getRecentEvents action...');
-    const events = await EventStorage.getRecentEvents(message.limit || 5);
-    console.log('getRecentEvents returning', events.length, 'events');
-    return { success: true, events };
+  if (!message || typeof message.action !== 'string') {
+    return { success: false, error: 'Invalid message' };
+  }
 
-  case 'clearHistory':
+  switch (message.action) {
+  case 'getRecentEvents': {
+    const events = await EventStorage.getRecentEvents(message.limit);
+    return { success: true, events };
+  }
+
+  case 'clearHistory': {
     await EventStorage.clearHistory();
     return { success: true };
+  }
 
-  case 'getEvent':
+  case 'getEvent': {
     const event = await EventStorage.getEvent(message.id);
     return { success: true, event };
+  }
 
-  case 'deleteEvent':
+  case 'deleteEvent': {
     const deleted = await EventStorage.deleteEvent(message.id);
     return { success: true, deleted };
+  }
 
-  case 'getSessionCount':
+  case 'getSessionCount': {
+    await loadSessionCount();
     return { success: true, count: sessionEventCount };
+  }
 
   default:
     return { success: false, error: 'Unknown action' };
@@ -459,10 +556,14 @@ function parseEventFromText(text) {
     endTime: false
   };
 
-  log('Parsing text:', text);
+  log('Parsing text:', text.length, 'chars');
+
+  // Recurring weekday codes are parsed up front so the title cleaner knows
+  // exactly which token ("MWF", "TuTh") to strip instead of guessing.
+  const weekdayResult = parseWeekdays(text);
 
   // Extract title
-  parseResult.title = extractTitle(text);
+  parseResult.title = extractTitle(text, weekdayResult.original);
 
   // Extract date
   const dateResult = extractDate(text, now);
@@ -470,7 +571,7 @@ function parseEventFromText(text) {
   if (dateResult.date) {
     baseDate = dateResult.date;
     parsed.date = true;
-    log('Extracted date:', baseDate, `(${dateResult.type})`);
+    log('Extracted date:', dateResult.type);
   }
 
   // Check for time range FIRST (e.g., "6-8pm", "10am-2pm")
@@ -500,8 +601,7 @@ function parseEventFromText(text) {
     durationFromRange = true;
     parsed.duration = true;
 
-    log(`Extracted time range: ${startHours}:${String(startMinutes).padStart(2, '0')} - ${timeRangeResult.endHours}:${String(timeRangeResult.endMinutes).padStart(2, '0')} (${timeRangeResult.type})`);
-    log(`Duration from range: ${durationMs / 60000} minutes`);
+    log(`Extracted time range, duration ${durationMs / 60000} minutes`);
   } else {
     // Fall back to single time extraction
     const timeResult = extractTime(text);
@@ -509,7 +609,7 @@ function parseEventFromText(text) {
       startHours = timeResult.hours;
       startMinutes = timeResult.minutes;
       parsed.time = true;
-      log(`Extracted time: ${startHours}:${String(startMinutes).padStart(2, '0')} (${timeResult.type})`);
+      log('Extracted time:', timeResult.type);
     }
   }
 
@@ -557,26 +657,24 @@ function parseEventFromText(text) {
   // Calculate end date
   parseResult.endDate = new Date(parseResult.startDate.getTime() + durationMs);
 
-  // Check for recurring weekday patterns (MWF, TTh, etc.)
-  const weekdayResult = parseWeekdays(text);
+  // Recurring weekday patterns (MWF, TTh, ...)
   if (weekdayResult.found) {
     parseResult.recurrence = {
       isRecurring: true,
       days: weekdayResult.days,
       frequency: 'WEEKLY'
     };
-    log('Found recurring pattern:', weekdayResult.days.join(','), `(from "${weekdayResult.original}")`);
+    log('Found recurring pattern:', weekdayResult.days.join(','));
 
-    // If no explicit date was found, use the next occurrence of the first day
-    if (!parsed.date && weekdayResult.days.length > 0) {
-      const nextDay = getNextWeekday(now, weekdayResult.days[0]);
-      parseResult.startDate.setFullYear(nextDay.getFullYear());
-      parseResult.startDate.setMonth(nextDay.getMonth());
-      parseResult.startDate.setDate(nextDay.getDate());
-      log('Set start date to next', weekdayResult.days[0], ':', parseResult.startDate.toDateString());
-
-      // Recalculate end date
-      parseResult.endDate = new Date(parseResult.startDate.getTime() + durationMs);
+    // Without an explicit date, start on the soonest upcoming day of the
+    // pattern rather than today, keeping the time of day already parsed.
+    if (!parsed.date) {
+      const aligned = nextRecurrenceStart(now, weekdayResult.days, parseResult.startDate);
+      if (aligned) {
+        parseResult.startDate = aligned;
+        parseResult.endDate = new Date(aligned.getTime() + durationMs);
+        log('Aligned start to next occurrence:', aligned.toDateString());
+      }
     }
   }
 
@@ -629,7 +727,7 @@ function calculateConfidence(parsed, text) {
  * @param {string} text - The text to clean
  * @returns {string} - Text with date/time patterns removed
  */
-function cleanTitle(text) {
+function cleanTitle(text, weekdayCode) {
   // First, convert newlines to spaces
   let result = text.replace(/\n/g, ' ');
 
@@ -639,9 +737,12 @@ function cleanTitle(text) {
   // Abbreviated day names: Mon, Tue, Wed, Thu, Fri, Sat, Sun
   result = result.replace(/\b(mon|tue|wed|thu|fri|sat|sun)\b,?\s*/gi, '');
 
-  // Compact weekday codes: MWF, TTh, MTWThF, MW, TR, etc.
-  // Match sequences of day letters (at least 2 chars) that look like schedules
-  result = result.replace(/\b[MTWRFSU][MTWRFSUhau]{1,}\b/g, '');
+  // The compact schedule code, but only the one actually recognised as a
+  // recurrence ("MWF"). A blind [MTWRFSU]+ sweep here used to eat words such
+  // as "US" and "MT" out of perfectly good titles.
+  if (weekdayCode) {
+    result = result.replace(new RegExp(`\\b${escapeRegExp(weekdayCode)}\\b`, 'g'), '');
+  }
 
   // Class type indicators: LEC, LAB, DIS, SEM (lecture, lab, discussion, seminar)
   result = result.replace(/\b(LEC|LAB|DIS|SEM|LECTURE|DISCUSSION|SEMINAR|LABORATORY)\b/gi, '');
@@ -650,21 +751,24 @@ function cleanTitle(text) {
   result = result.replace(/\b(today|tomorrow|day after tomorrow|next\s+week|this\s+week)\b/gi, '');
 
   // Time ranges with single-letter or full meridiem: "8:00A - 11:00A", "6-8pm", "9am-5pm"
-  // Handles hyphen (-), en-dash (–), em-dash (—), and "to"
-  result = result.replace(/\b\d{1,2}(?::\d{2})?\s*(?:a\.?m?\.?|p\.?m?\.?)?\s*(?:-|–|—|to)\s*\d{1,2}(?::\d{2})?\s*(?:a\.?m?\.?|p\.?m?\.?)\b/gi, '');
+  // Handles hyphen (-), en-dash, em-dash, and "to"
+  result = result.replace(
+    new RegExp(`\\b${HOUR_12}(?::[0-5]\\d)?\\s*${MERIDIEM}?\\s*(?:-|\u2013|\u2014|to)\\s*${HOUR_12}(?::[0-5]\\d)?\\s*${MERIDIEM}`, 'gi'),
+    ''
+  );
 
   // Times with "at": "at 3pm", "at 11:59 PM", "at noon", "at midnight", "at 3P"
-  result = result.replace(/\bat\s+\d{1,2}(?::\d{2})?\s*(?:a\.?m?\.?|p\.?m?\.?)?/gi, '');
+  result = result.replace(new RegExp(`\\bat\\s+\\d{1,2}(?::\\d{2})?\\s*${MERIDIEM}?`, 'gi'), '');
   result = result.replace(/\bat\s+(?:noon|midnight)\b/gi, '');
 
-  // Standalone times with single-letter meridiem: "8:00A", "11:00A", "3P", "3:00 pm"
-  result = result.replace(/\b\d{1,2}(?::\d{2})?\s*(?:a\.?m?\.?|p\.?m?\.?)\b/gi, '');
+  // Standalone times: "8:00A", "3P", "3:00 pm"
+  result = result.replace(new RegExp(`\\b${HOUR_12}(?::[0-5]\\d)?\\s*${MERIDIEM}`, 'gi'), '');
 
   // Time of day words: "morning", "afternoon", "evening", "night"
   result = result.replace(/\b(?:in\s+the\s+)?(?:morning|afternoon|evening|night)\b/gi, '');
 
   // Dates: MM/DD/YYYY, MM/DD, MM-DD-YYYY, MM-DD
-  result = result.replace(/\b\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?\b/gi, '');
+  result = result.replace(/\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b/gi, '');
 
   // Month day year: "January 5, 2025", "Jan 5 2025", "January 5th"
   const monthPattern = 'january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sept|sep|october|oct|november|nov|december|dec';
@@ -680,39 +784,38 @@ function cleanTitle(text) {
   result = result.replace(/\bfor\s+(?:an?\s+)?(?:\d+(?:\.\d+)?\s*)?(?:hours?|hrs?|minutes?|mins?|half\s+(?:an?\s+)?hour)\b/gi, '');
 
   // "until" phrases: "until 5pm", "until noon"
-  result = result.replace(/\buntil\s+\d{1,2}(?::\d{2})?\s*(?:a\.?m?\.?|p\.?m?\.?)?/gi, '');
+  result = result.replace(new RegExp(`\\buntil\\s+\\d{1,2}(?::\\d{2})?\\s*${MERIDIEM}?`, 'gi'), '');
   result = result.replace(/\buntil\s+(?:noon|midnight)\b/gi, '');
 
   // Clean up leftover connecting words at start/end
-  // Remove leading: DUE, on, at, from, to, starting, ending, begins, ends
-  result = result.replace(/^[\s,\-–—:]*\b(DUE|on|at|from|to|starting|ending|begins|ends|by)\b[\s,\-–—:]*/gi, '');
-
-  // Remove trailing: on, at, from, to, DUE
-  result = result.replace(/[\s,\-–—:]*\b(on|at|from|to|DUE)\b[\s,\-–—:]*$/gi, '');
+  result = result.replace(/^[\s,\-\u2013\u2014:]*\b(DUE|on|at|from|to|starting|ending|begins|ends|by)\b[\s,\-\u2013\u2014:]*/gi, '');
+  result = result.replace(/[\s,\-\u2013\u2014:]*\b(on|at|from|to|DUE)\b[\s,\-\u2013\u2014:]*$/gi, '');
 
   // Clean up multiple spaces
   result = result.replace(/\s+/g, ' ');
 
   // Clean up punctuation left over (leading/trailing commas, colons, dashes, parentheses)
-  result = result.replace(/^[\s,\-–—:()]+/, '');
-  result = result.replace(/[\s,\-–—:()]+$/, '');
+  result = result.replace(/^[\s,\-\u2013\u2014:()]+/, '');
+  result = result.replace(/[\s,\-\u2013\u2014:()]+$/, '');
 
   // One more pass for connecting words that might now be at edges
-  result = result.replace(/^[\s,\-–—:]*\b(DUE|on|at|from|to)\b[\s,\-–—:]*/gi, '');
-  result = result.replace(/[\s,\-–—:]*\b(on|at|from|to|DUE)\b[\s,\-–—:]*$/gi, '');
+  result = result.replace(/^[\s,\-\u2013\u2014:]*\b(DUE|on|at|from|to)\b[\s,\-\u2013\u2014:]*/gi, '');
+  result = result.replace(/[\s,\-\u2013\u2014:]*\b(on|at|from|to|DUE)\b[\s,\-\u2013\u2014:]*$/gi, '');
 
   return result.trim();
 }
 
 /**
  * Extract a suitable title from the text
+ * @param {string} text - The selected text
+ * @param {string|null} weekdayCode - Recognised schedule code to strip, if any
  */
-function extractTitle(text) {
+function extractTitle(text, weekdayCode) {
   // Clean up whitespace first
   const cleaned = text.replace(/\s+/g, ' ').trim();
 
   // Try to clean date/time from the title
-  const titleWithoutDateTime = cleanTitle(cleaned);
+  const titleWithoutDateTime = cleanTitle(cleaned, weekdayCode);
 
   // Use cleaned title if it has meaningful content (at least 3 chars)
   // Otherwise fall back to original text
@@ -771,17 +874,11 @@ const DAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 
 function extractDate(text, now) {
   const lowerText = text.toLowerCase();
 
-  // Debug logging helper
   const debugLog = (pattern, matched, match = null) => {
     if (CONFIG.DEBUG) {
-      console.log(`  [extractDate] Pattern "${pattern}": ${matched ? 'MATCHED' : 'no match'}${match ? ` → "${match}"` : ''}`);
+      console.log(`  [extractDate] Pattern "${pattern}": ${matched ? 'MATCHED' : 'no match'}${match ? ` \u2192 "${match}"` : ''}`);
     }
   };
-
-  if (CONFIG.DEBUG) {
-    console.log(`[extractDate] Input: "${text}"`);
-    console.log(`[extractDate] LowerText: "${lowerText}"`);
-  }
 
   // Order matters - SPECIFIC dates beat GENERAL day names
   // Check numeric/explicit date formats BEFORE day names
@@ -790,24 +887,26 @@ function extractDate(text, now) {
   const isoMatch = text.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
   debugLog('ISO (YYYY-MM-DD)', !!isoMatch, isoMatch?.[0]);
   if (isoMatch) {
-    const year = parseInt(isoMatch[1], 10);
-    const month = parseInt(isoMatch[2], 10) - 1;
-    const day = parseInt(isoMatch[3], 10);
-    const date = new Date(year, month, day);
-    if (isValidDate(date)) {
+    const date = makeDate(
+      parseInt(isoMatch[1], 10),
+      parseInt(isoMatch[2], 10) - 1,
+      parseInt(isoMatch[3], 10)
+    );
+    if (date) {
       return { date, type: 'iso' };
     }
   }
 
   // 2. MM/DD/YYYY or MM-DD-YYYY (full date with year)
-  const fullDateMatch = text.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b/);
+  const fullDateMatch = text.match(/\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b/);
   debugLog('MM/DD/YYYY', !!fullDateMatch, fullDateMatch?.[0]);
   if (fullDateMatch) {
-    const month = parseInt(fullDateMatch[1], 10) - 1;
-    const day = parseInt(fullDateMatch[2], 10);
-    const year = parseInt(fullDateMatch[3], 10);
-    const date = new Date(year, month, day);
-    if (isValidDate(date)) {
+    const date = makeDate(
+      parseInt(fullDateMatch[3], 10),
+      parseInt(fullDateMatch[1], 10) - 1,
+      parseInt(fullDateMatch[2], 10)
+    );
+    if (date) {
       return { date, type: 'mm-dd-yyyy' };
     }
   }
@@ -820,35 +919,25 @@ function extractDate(text, now) {
   const monthDayYearMatch = text.match(monthDayYearRegex);
   debugLog('month day year', !!monthDayYearMatch, monthDayYearMatch?.[0]);
   if (monthDayYearMatch) {
-    const month = MONTHS[monthDayYearMatch[1].toLowerCase()];
-    const day = parseInt(monthDayYearMatch[2], 10);
-    const year = parseInt(monthDayYearMatch[3], 10);
-    const date = new Date(year, month, day);
-    if (isValidDate(date)) {
+    const date = makeDate(
+      parseInt(monthDayYearMatch[3], 10),
+      MONTHS[monthDayYearMatch[1].toLowerCase()],
+      parseInt(monthDayYearMatch[2], 10)
+    );
+    if (date) {
       return { date, type: 'month-day-year' };
     }
   }
 
-  // 4. MM/DD (no year) - use negative lookbehind to avoid matching times like "11:59"
-  // Only match if preceded by word boundary or space, not by colon
+  // 4. MM/DD (no year) - the lookbehind keeps times like "11:59" out
   const shortDateMatch = text.match(/(?<!:)\b(\d{1,2})\/(\d{1,2})\b(?!\/\d)/);
   debugLog('MM/DD (no year)', !!shortDateMatch, shortDateMatch?.[0]);
   if (shortDateMatch) {
     const month = parseInt(shortDateMatch[1], 10);
     const day = parseInt(shortDateMatch[2], 10);
-    // Validate month (1-12) and day (1-31) ranges
     if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
-      const year = now.getFullYear();
-      let date = new Date(year, month - 1, day);
-
-      // Compare dates only (not times) to avoid same-day issues
-      const todayMidnight = new Date(now);
-      todayMidnight.setHours(0, 0, 0, 0);
-      if (date < todayMidnight) {
-        date = new Date(year + 1, month - 1, day);
-      }
-
-      if (isValidDate(date)) {
+      const date = rollForward(makeDate(now.getFullYear(), month - 1, day), now, month - 1, day);
+      if (date) {
         return { date, type: 'mm-dd' };
       }
     }
@@ -859,26 +948,13 @@ function extractDate(text, now) {
     `\\b(${MONTH_PATTERN})\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:\\b|,|$)`,
     'i'
   );
-  if (CONFIG.DEBUG) {
-    console.log(`  [extractDate] Month-day regex pattern: ${monthDayRegex}`);
-  }
   const monthDayMatch = text.match(monthDayRegex);
   debugLog('month day (no year)', !!monthDayMatch, monthDayMatch?.[0]);
   if (monthDayMatch) {
     const month = MONTHS[monthDayMatch[1].toLowerCase()];
     const day = parseInt(monthDayMatch[2], 10);
-    const year = now.getFullYear();
-    let date = new Date(year, month, day);
-
-    // If date is in the past, assume next year
-    // Compare dates only (not times) to avoid same-day issues
-    const todayMidnight = new Date(now);
-    todayMidnight.setHours(0, 0, 0, 0);
-    if (date < todayMidnight) {
-      date = new Date(year + 1, month, day);
-    }
-
-    if (isValidDate(date)) {
+    const date = rollForward(makeDate(now.getFullYear(), month, day), now, month, day);
+    if (date) {
       return { date, type: 'month-day' };
     }
   }
@@ -893,18 +969,13 @@ function extractDate(text, now) {
   if (dayMonthMatch) {
     const day = parseInt(dayMonthMatch[1], 10);
     const month = MONTHS[dayMonthMatch[2].toLowerCase()];
-    const year = dayMonthMatch[3] ? parseInt(dayMonthMatch[3], 10) : now.getFullYear();
-    let date = new Date(year, month, day);
-
-    // If no year specified and date is in the past, assume next year
-    // Compare dates only (not times) to avoid same-day issues
-    const todayMidnight = new Date(now);
-    todayMidnight.setHours(0, 0, 0, 0);
-    if (!dayMonthMatch[3] && date < todayMidnight) {
-      date = new Date(year + 1, month, day);
+    const hasYear = !!dayMonthMatch[3];
+    const year = hasYear ? parseInt(dayMonthMatch[3], 10) : now.getFullYear();
+    let date = makeDate(year, month, day);
+    if (!hasYear) {
+      date = rollForward(date, now, month, day);
     }
-
-    if (isValidDate(date)) {
+    if (date) {
       return { date, type: 'day-month' };
     }
   }
@@ -913,37 +984,26 @@ function extractDate(text, now) {
   const todayMatch = /\btoday\b/.test(lowerText);
   debugLog('today', todayMatch);
   if (todayMatch) {
-    const date = new Date(now);
-    date.setHours(0, 0, 0, 0);
-    return { date, type: 'relative-today' };
+    return { date: startOfDay(now, 0), type: 'relative-today' };
   }
 
   const tomorrowMatch = /\btomorrow\b/.test(lowerText);
   debugLog('tomorrow', tomorrowMatch);
   if (tomorrowMatch) {
-    const date = new Date(now);
-    date.setDate(date.getDate() + 1);
-    date.setHours(0, 0, 0, 0);
-    return { date, type: 'relative-tomorrow' };
+    return { date: startOfDay(now, 1), type: 'relative-tomorrow' };
   }
 
   const dayAfterMatch = /\b(day after tomorrow|day after tmrw)\b/.test(lowerText);
   debugLog('day after tomorrow', dayAfterMatch);
   if (dayAfterMatch) {
-    const date = new Date(now);
-    date.setDate(date.getDate() + 2);
-    date.setHours(0, 0, 0, 0);
-    return { date, type: 'relative-dayafter' };
+    return { date: startOfDay(now, 2), type: 'relative-dayafter' };
   }
 
   // 8. Next week
   const nextWeekMatch = /\bnext\s+week\b/.test(lowerText);
   debugLog('next week', nextWeekMatch);
   if (nextWeekMatch) {
-    const date = new Date(now);
-    date.setDate(date.getDate() + 7);
-    date.setHours(0, 0, 0, 0);
-    return { date, type: 'relative-nextweek' };
+    return { date: startOfDay(now, 7), type: 'relative-nextweek' };
   }
 
   // 9. "next [day]" or "this [day]"
@@ -951,13 +1011,10 @@ function extractDate(text, now) {
   debugLog('next/this [day]', !!dayModifierMatch, dayModifierMatch?.[0]);
   if (dayModifierMatch) {
     const modifier = dayModifierMatch[1];
-    const targetDayName = dayModifierMatch[2];
-    const targetDay = DAYS.indexOf(targetDayName);
-    const date = new Date(now);
-    date.setHours(0, 0, 0, 0);
+    const targetDay = DAYS.indexOf(dayModifierMatch[2]);
+    const date = startOfDay(now, 0);
 
-    const currentDay = date.getDay();
-    let daysToAdd = targetDay - currentDay;
+    let daysToAdd = targetDay - date.getDay();
 
     if (modifier === 'next') {
       // "next Monday" means the Monday of next week
@@ -965,12 +1022,9 @@ function extractDate(text, now) {
         daysToAdd += 7;
       }
       daysToAdd += 7; // Add another week for "next"
-    } else {
+    } else if (daysToAdd < 0) {
       // "this Monday" means the upcoming Monday (or today if it's Monday)
-      if (daysToAdd < 0) {
-        daysToAdd += 7;
-      }
-      // If it's the same day, keep it (this Monday = today if today is Monday)
+      daysToAdd += 7;
     }
 
     date.setDate(date.getDate() + daysToAdd);
@@ -979,14 +1033,12 @@ function extractDate(text, now) {
 
   // 10. Standalone day names (next occurrence) - LAST because least specific
   const standaloneDayMatch = lowerText.match(/\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
-  debugLog('standalone day', !!standaloneDayMatch && !dayModifierMatch, standaloneDayMatch?.[0]);
-  if (standaloneDayMatch && !dayModifierMatch) {
+  debugLog('standalone day', !!standaloneDayMatch, standaloneDayMatch?.[0]);
+  if (standaloneDayMatch) {
     const targetDay = DAYS.indexOf(standaloneDayMatch[1]);
-    const date = new Date(now);
-    date.setHours(0, 0, 0, 0);
+    const date = startOfDay(now, 0);
 
-    const currentDay = date.getDay();
-    let daysToAdd = targetDay - currentDay;
+    let daysToAdd = targetDay - date.getDay();
 
     // If it's today or in the past this week, go to next week
     if (daysToAdd <= 0) {
@@ -1002,6 +1054,55 @@ function extractDate(text, now) {
 }
 
 /**
+ * Midnight, `offsetDays` from the given date
+ */
+function startOfDay(from, offsetDays) {
+  const date = new Date(from);
+  date.setDate(date.getDate() + offsetDays);
+  date.setHours(0, 0, 0, 0);
+  return date;
+}
+
+/**
+ * Build a local date, rejecting values that silently roll over
+ * (`new Date(2025, 1, 30)` quietly becomes March 2nd).
+ * @returns {Date|null}
+ */
+function makeDate(year, month, day) {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) {
+    return null;
+  }
+  if (year < 1970 || year > 2100) {
+    return null;
+  }
+  const date = new Date(year, month, day);
+  if (!isValidDate(date) ||
+      date.getFullYear() !== year ||
+      date.getMonth() !== month ||
+      date.getDate() !== day) {
+    return null;
+  }
+  return date;
+}
+
+/**
+ * A date with no year that has already passed means next year.
+ * Compares whole days so an event earlier today still counts as today.
+ * @returns {Date|null}
+ */
+function rollForward(date, now, month, day) {
+  if (!date) {
+    return null;
+  }
+  const todayMidnight = new Date(now);
+  todayMidnight.setHours(0, 0, 0, 0);
+  if (date < todayMidnight) {
+    return makeDate(date.getFullYear() + 1, month, day);
+  }
+  return date;
+}
+
+/**
  * Validate that a date is reasonable
  */
 function isValidDate(date) {
@@ -1012,120 +1113,115 @@ function isValidDate(date) {
 // TIME EXTRACTION
 // =============================================================================
 
+// Compiled once. Neither carries the /g flag, so they hold no lastIndex state
+// between calls.
+//
+// Groups: 1=startHour, 2=startMin, 3=startMeridiem, 4=endHour, 5=endMin, 6=endMeridiem
+// Covers "6-8pm", "6pm - 8pm", "6:00-8:00pm", "10am-2pm", "8:00A - 11:00A",
+// "6 to 8pm", and en/em-dash variants.
+const TIME_RANGE_REGEX = new RegExp(
+  `\\b(${HOUR_12})(?::([0-5]\\d))?\\s*(${MERIDIEM})?\\s*(?:-|\u2013|\u2014|to)\\s*(${HOUR_12})(?::([0-5]\\d))?\\s*(${MERIDIEM})`,
+  'i'
+);
+
+const TIME_12_REGEX = new RegExp(`\\b(${HOUR_12})(?::([0-5]\\d))?\\s*(${MERIDIEM})`, 'i');
+
+const NO_TIME_RANGE = Object.freeze({
+  found: false,
+  startHours: null,
+  startMinutes: 0,
+  endHours: null,
+  endMinutes: 0,
+  type: 'none'
+});
+
+/**
+ * Pick the 24-hour start hour when only the end of a range carried a meridiem.
+ *
+ * Both readings of the bare start hour are scored by the event length they
+ * imply (wrapping past midnight) and the shortest sensible one wins:
+ *   "6-8pm"   6am would be 14h  -> 6pm      "10-2pm"  10pm would be negative -> 10am
+ *   "12-2pm"  12am would be 14h -> noon     "11-12am" 11am would be 13h     -> 11pm
+ *
+ * @returns {number} start hour in 24-hour form
+ */
+function inferStartHour(startHours, startMinutes, endHours, endMinutes) {
+  const endTotal = endHours * 60 + endMinutes;
+  const asAm = startHours === 12 ? 0 : startHours;
+  const asPm = startHours === 12 ? 12 : startHours + 12;
+
+  let best = null;
+  for (const hour of [asAm, asPm]) {
+    let minutes = endTotal - (hour * 60 + startMinutes);
+    if (minutes <= 0) {
+      minutes += 24 * 60; // range runs past midnight
+    }
+    if (minutes <= 12 * 60 && (!best || minutes < best.minutes)) {
+      best = { hour, minutes };
+    }
+  }
+
+  // Neither reading gives a sane length (e.g. "1-1am") - keep the AM reading
+  // and let the caller's next-day handling sort out the duration.
+  return best ? best.hour : asAm;
+}
+
 /**
  * Extract a time range from text (e.g., "6-8pm", "6pm-8pm", "10am-2pm")
  * @param {string} text - The text to parse
  * @returns {Object} - { found, startHours, startMinutes, endHours, endMinutes, type }
  */
 function extractTimeRange(text) {
-  const lowerText = text.toLowerCase();
-
-  log('[extractTimeRange] Input:', text);
-
-  // Time range patterns:
-  // Pattern 1: "6-8pm", "6-8 pm", "6 - 8pm" (meridiem only on end)
-  // Pattern 2: "6pm-8pm", "6pm - 8pm" (meridiem on both)
-  // Pattern 3: "6:00-8:00pm", "6:30-8:30pm" (with minutes, meridiem on end)
-  // Pattern 4: "6:00pm-8:00pm" (with minutes, meridiem on both)
-  // Pattern 5: "6pm to 8pm", "6 to 8pm" (using "to" instead of dash)
-  // Pattern 6: "10am-2pm" (different meridiems - crosses noon)
-  // Pattern 7: "8:00A - 11:00A" (single letter meridiem)
-  // Pattern 8: "8A - 11A" (single letter, no minutes)
-
-  // Comprehensive regex that handles all patterns
-  // Meridiem pattern matches: am, AM, a.m., A.M., a, A, pm, PM, p.m., P.M., p, P
-  // Groups: 1=startHour, 2=startMin, 3=startMeridiem, 4=endHour, 5=endMin, 6=endMeridiem
-  const timeRangeRegex = /\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m?\.?|p\.?m?\.?)?\s*(?:-|–|—|to)\s*(\d{1,2})(?::(\d{2}))?\s*(a\.?m?\.?|p\.?m?\.?)\b/i;
-
-  const match = text.match(timeRangeRegex);
-
-  if (match) {
-    log('[extractTimeRange] Match found:', match[0]);
-    log('[extractTimeRange] Groups:', {
-      startHour: match[1],
-      startMin: match[2],
-      startMeridiem: match[3],
-      endHour: match[4],
-      endMin: match[5],
-      endMeridiem: match[6]
-    });
-
-    let startHours = parseInt(match[1], 10);
-    const startMinutes = match[2] ? parseInt(match[2], 10) : 0;
-    const startMeridiem = match[3];
-
-    let endHours = parseInt(match[4], 10);
-    const endMinutes = match[5] ? parseInt(match[5], 10) : 0;
-    const endMeridiem = match[6];
-
-    // Validate hour values
-    if (startHours < 1 || startHours > 12 || endHours < 1 || endHours > 12) {
-      log('[extractTimeRange] Invalid hour values, skipping');
-      return { found: false, startHours: null, startMinutes: 0, endHours: null, endMinutes: 0, type: 'none' };
-    }
-
-    // Convert end time to 24-hour format
-    const endIsPM = /^p/i.test(endMeridiem);
-    if (endIsPM && endHours !== 12) {
-      endHours += 12;
-    } else if (!endIsPM && endHours === 12) {
-      endHours = 0;
-    }
-
-    // Convert start time to 24-hour format
-    if (startMeridiem) {
-      // Start has explicit meridiem
-      const startIsPM = /^p/i.test(startMeridiem);
-      if (startIsPM && startHours !== 12) {
-        startHours += 12;
-      } else if (!startIsPM && startHours === 12) {
-        startHours = 0;
-      }
-    } else {
-      // Infer start meridiem from end meridiem and logic
-      // "6-8pm" → both PM (6pm-8pm)
-      // "10-2pm" → 10am-2pm (crosses noon, start must be AM)
-      // "6-8am" → both AM
-
-      if (endIsPM) {
-        // End is PM
-        if (startHours <= endHours % 12 || endHours % 12 === 0) {
-          // Same meridiem: "6-8pm" → 6pm, 8pm
-          if (startHours !== 12) {
-            startHours += 12;
-          }
-        } else {
-          // Crosses noon: "10-2pm" → 10am, 2pm
-          // startHours stays as-is (AM)
-          if (startHours === 12) {
-            startHours = 0; // 12 without meridiem before PM end = 12am = 0
-          }
-        }
-      } else {
-        // End is AM - start is also AM
-        if (startHours === 12) {
-          startHours = 0;
-        }
-      }
-    }
-
-    log('[extractTimeRange] Parsed times:', {
-      start: `${startHours}:${String(startMinutes).padStart(2, '0')}`,
-      end: `${endHours}:${String(endMinutes).padStart(2, '0')}`
-    });
-
-    return {
-      found: true,
-      startHours,
-      startMinutes,
-      endHours,
-      endMinutes,
-      type: 'time-range'
-    };
+  const match = text.match(TIME_RANGE_REGEX);
+  if (!match) {
+    return NO_TIME_RANGE;
   }
 
-  log('[extractTimeRange] No time range found');
-  return { found: false, startHours: null, startMinutes: 0, endHours: null, endMinutes: 0, type: 'none' };
+  let startHours = parseInt(match[1], 10);
+  const startMinutes = match[2] ? parseInt(match[2], 10) : 0;
+  const startMeridiem = match[3];
+
+  let endHours = parseInt(match[4], 10);
+  const endMinutes = match[5] ? parseInt(match[5], 10) : 0;
+  const endMeridiem = match[6];
+
+  // Validate hour and minute values
+  if (startHours < 1 || startHours > 12 || endHours < 1 || endHours > 12 ||
+      startMinutes > 59 || endMinutes > 59) {
+    log('[extractTimeRange] Out of range values, skipping');
+    return NO_TIME_RANGE;
+  }
+
+  // Convert end time to 24-hour format
+  const endIsPM = /^p/i.test(endMeridiem);
+  if (endIsPM && endHours !== 12) {
+    endHours += 12;
+  } else if (!endIsPM && endHours === 12) {
+    endHours = 0;
+  }
+
+  // Convert start time to 24-hour format
+  if (startMeridiem) {
+    const startIsPM = /^p/i.test(startMeridiem);
+    if (startIsPM && startHours !== 12) {
+      startHours += 12;
+    } else if (!startIsPM && startHours === 12) {
+      startHours = 0;
+    }
+  } else {
+    startHours = inferStartHour(startHours, startMinutes, endHours, endMinutes);
+  }
+
+  log('[extractTimeRange] Parsed range', `${startHours}:${startMinutes} - ${endHours}:${endMinutes}`);
+
+  return {
+    found: true,
+    startHours,
+    startMinutes,
+    endHours,
+    endMinutes,
+    type: 'time-range'
+  };
 }
 
 /**
@@ -1162,16 +1258,13 @@ function extractTime(text) {
   }
 
   // 3. 12-hour format: 3pm, 3:00pm, 3:00 PM, 3 pm, 3:30 a.m., 3P, 3:00A
-  // Meridiem pattern matches: am, AM, a.m., A.M., a, A, pm, PM, p.m., P.M., p, P
-  const time12Regex = /\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m?\.?|p\.?m?\.?)\b/i;
-  const time12Match = text.match(time12Regex);
+  const time12Match = text.match(TIME_12_REGEX);
   if (time12Match) {
     let hours = parseInt(time12Match[1], 10);
     const minutes = time12Match[2] ? parseInt(time12Match[2], 10) : 0;
     const isPM = /^p/i.test(time12Match[3]);
 
-    // Validate hours
-    if (hours >= 1 && hours <= 12) {
+    if (hours >= 1 && hours <= 12 && minutes <= 59) {
       if (isPM && hours !== 12) {
         hours += 12;
       } else if (!isPM && hours === 12) {
@@ -1182,8 +1275,7 @@ function extractTime(text) {
   }
 
   // 4. 24-hour format: 15:00, 09:30 (but not dates like 01/05)
-  const time24Regex = /(?<![\/\-\d])(\d{1,2}):(\d{2})(?![\/\-\d])/;
-  const time24Match = text.match(time24Regex);
+  const time24Match = text.match(/(?<![/\-\d])(\d{1,2}):(\d{2})(?![/\-\d])/);
   if (time24Match) {
     const hours = parseInt(time24Match[1], 10);
     const minutes = parseInt(time24Match[2], 10);
@@ -1194,13 +1286,13 @@ function extractTime(text) {
   }
 
   // 5. "at [number]" without am/pm - guess based on context
-  const atTimeMatch = text.match(/\bat\s+(\d{1,2})\b(?!\s*[:\d\/\-])/i);
+  const atTimeMatch = text.match(/\bat\s+(\d{1,2})\b(?!\s*[:\d/\-])/i);
   if (atTimeMatch) {
     let hours = parseInt(atTimeMatch[1], 10);
 
     if (hours >= 1 && hours <= 12) {
       // Assume PM for hours 1-7 (business hours), AM for 8-12
-      if (hours >= 1 && hours <= 7) {
+      if (hours <= 7) {
         hours += 12;
       }
       return { found: true, hours, minutes: 0, type: 'at-number' };
@@ -1208,12 +1300,12 @@ function extractTime(text) {
   }
 
   // 6. Standalone hour with o'clock: "3 o'clock"
-  const oclockMatch = text.match(/\b(\d{1,2})\s*o['']?clock\b/i);
+  const oclockMatch = text.match(/\b(\d{1,2})\s*o['\u2018\u2019]?clock\b/i);
   if (oclockMatch) {
     let hours = parseInt(oclockMatch[1], 10);
     if (hours >= 1 && hours <= 12) {
       // Assume PM for hours 1-7
-      if (hours >= 1 && hours <= 7) {
+      if (hours <= 7) {
         hours += 12;
       }
       return { found: true, hours, minutes: 0, type: 'oclock' };
@@ -1358,92 +1450,131 @@ function extractDuration(text, startHours, startMinutes) {
  * @returns {Object} - { found: boolean, days: ['MO', 'WE', 'FR'], original: 'MWF' }
  */
 function parseWeekdays(text) {
-  // Map of day codes to Google Calendar format
-  const dayMap = {
-    'SU': 'SU', 'U': 'SU',           // Sunday
-    'MO': 'MO', 'M': 'MO',           // Monday
-    'TU': 'TU', 'T': 'TU',           // Tuesday
-    'WE': 'WE', 'W': 'WE',           // Wednesday
-    'TH': 'TH', 'R': 'TH',           // Thursday (R is common academic notation)
-    'FR': 'FR', 'F': 'FR',           // Friday
-    'SA': 'SA', 'S': 'SA'            // Saturday
-  };
+  const compact = parseCompactWeekdays(text);
+  if (compact) {
+    return compact;
+  }
+  return parseSpelledWeekdays(text);
+}
 
-  // Day order for sorting
-  const dayOrder = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
+// Ordered Monday-first: a real schedule code lists its days in this order.
+const DAY_ORDER = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU'];
 
-  // Try to find compact weekday codes like MWF, TTh, MTWThF
-  // This regex looks for standalone sequences of day letters
-  // Must have at least 2 characters and be word-bounded
-  const compactPattern = /\b([MTWRFSU][MTWRFSUhau]{1,})\b/g;
+const DAY_TOKENS_3 = {
+  MON: 'MO', TUE: 'TU', WED: 'WE', THU: 'TH', FRI: 'FR', SAT: 'SA', SUN: 'SU'
+};
 
-  let match;
-  while ((match = compactPattern.exec(text)) !== null) {
-    const code = match[1];
-    const days = [];
-    let i = 0;
+const DAY_TOKENS_2 = {
+  MO: 'MO', TU: 'TU', WE: 'WE', TH: 'TH', FR: 'FR', SA: 'SA', SU: 'SU'
+};
 
-    while (i < code.length) {
-      const remaining = code.substring(i).toUpperCase();
+// R is the common academic notation for Thursday
+const DAY_TOKENS_1 = {
+  M: 'MO', T: 'TU', W: 'WE', R: 'TH', F: 'FR', S: 'SA', U: 'SU'
+};
 
-      // Check for two-letter codes first (Th, Sa, Su)
-      if (remaining.length >= 2) {
-        const twoChar = remaining.substring(0, 2);
-        if (twoChar === 'TH' || twoChar === 'SA' || twoChar === 'SU') {
-          days.push(dayMap[twoChar]);
-          i += 2;
-          continue;
-        }
-      }
+/**
+ * Split a compact schedule code ("MWF", "TuTh", "MTWThF") into day codes.
+ *
+ * Longest token first, so "TuTh" is Tuesday+Thursday rather than
+ * Tuesday+Sunday+Thursday. Returns null the moment a character cannot be
+ * consumed - that full-consumption rule is what stops ordinary words from
+ * being read as schedules.
+ *
+ * @returns {string[]|null}
+ */
+function tokenizeDayCode(code) {
+  const upper = code.toUpperCase();
+  const days = [];
+  let i = 0;
 
-      // Single letter codes
-      const oneChar = remaining[0];
-      if (dayMap[oneChar]) {
-        days.push(dayMap[oneChar]);
-        i += 1;
-      } else {
-        // Unknown character, skip it
-        i += 1;
-      }
-    }
+  while (i < upper.length) {
+    const three = upper.substring(i, i + 3);
+    const two = upper.substring(i, i + 2);
+    const one = upper[i];
 
-    // Only return if we found multiple unique days (recurring pattern)
-    const uniqueDays = [...new Set(days)];
-    if (uniqueDays.length >= 2) {
-      // Sort by day order
-      uniqueDays.sort((a, b) => dayOrder.indexOf(a) - dayOrder.indexOf(b));
-      return { found: true, days: uniqueDays, original: match[1] };
+    if (DAY_TOKENS_3[three]) {
+      days.push(DAY_TOKENS_3[three]);
+      i += 3;
+    } else if (DAY_TOKENS_2[two]) {
+      days.push(DAY_TOKENS_2[two]);
+      i += 2;
+    } else if (DAY_TOKENS_1[one]) {
+      days.push(DAY_TOKENS_1[one]);
+      i += 1;
+    } else {
+      return null;
     }
   }
 
-  // Try spaced/comma/slash formats: "M, W, F" or "Mon Wed Fri" or "Tue/Thu"
-  const spacedPattern = /\b((?:mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)(?:\s*[,\/\s]\s*(?:mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday))+)\b/gi;
+  return days;
+}
+
+/**
+ * Find a compact weekday code such as MWF, TTh or MTWThF.
+ * @returns {Object|null} - { found, days, original }
+ */
+function parseCompactWeekdays(text) {
+  // Local (not hoisted) because of the /g flag: a shared instance would carry
+  // lastIndex across calls and start matching mid-string.
+  const compactPattern = /\b([MTWRFSU][MTWRFSUhuae]+)\b/g;
+
+  let match;
+  while ((match = compactPattern.exec(text)) !== null) {
+    const days = tokenizeDayCode(match[1]);
+    if (!days || days.length < 2) {
+      continue;
+    }
+
+    const unique = [...new Set(days)];
+    if (unique.length < 2) {
+      continue;
+    }
+
+    // A schedule code reads Monday-first and never repeats a day. Requiring
+    // strictly ascending order rejects acronyms like "US" (Sunday, Saturday)
+    // and "SF" that happen to be built from day letters.
+    const positions = unique.map((day) => DAY_ORDER.indexOf(day));
+    const ascending = positions.every((pos, index) => index === 0 || pos > positions[index - 1]);
+    if (!ascending || unique.length !== days.length) {
+      continue;
+    }
+
+    return { found: true, days: unique, original: match[1] };
+  }
+
+  return null;
+}
+
+/**
+ * Find spelled out day lists: "M, W, F", "Mon Wed Fri", "Tue/Thu"
+ * @returns {Object} - { found, days, original }
+ */
+function parseSpelledWeekdays(text) {
+  const spacedPattern = /\b((?:mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)(?:\s*[,/\s]\s*(?:mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday))+)\b/i;
 
   const spacedMatch = text.match(spacedPattern);
   if (spacedMatch) {
-    const dayWords = spacedMatch[0].toLowerCase().split(/[\s,\/]+/);
-    const days = [];
-
     const wordMap = {
-      'mon': 'MO', 'monday': 'MO',
-      'tue': 'TU', 'tuesday': 'TU',
-      'wed': 'WE', 'wednesday': 'WE',
-      'thu': 'TH', 'thursday': 'TH',
-      'fri': 'FR', 'friday': 'FR',
-      'sat': 'SA', 'saturday': 'SA',
-      'sun': 'SU', 'sunday': 'SU'
+      mon: 'MO', monday: 'MO',
+      tue: 'TU', tuesday: 'TU',
+      wed: 'WE', wednesday: 'WE',
+      thu: 'TH', thursday: 'TH',
+      fri: 'FR', friday: 'FR',
+      sat: 'SA', saturday: 'SA',
+      sun: 'SU', sunday: 'SU'
     };
 
-    for (const word of dayWords) {
-      if (wordMap[word]) {
-        days.push(wordMap[word]);
-      }
-    }
+    const days = spacedMatch[0]
+      .toLowerCase()
+      .split(/[\s,/]+/)
+      .map((word) => wordMap[word])
+      .filter(Boolean);
 
-    const uniqueDays = [...new Set(days)];
-    if (uniqueDays.length >= 2) {
-      uniqueDays.sort((a, b) => dayOrder.indexOf(a) - dayOrder.indexOf(b));
-      return { found: true, days: uniqueDays, original: spacedMatch[0] };
+    const unique = [...new Set(days)];
+    if (unique.length >= 2) {
+      unique.sort((a, b) => DAY_ORDER.indexOf(a) - DAY_ORDER.indexOf(b));
+      return { found: true, days: unique, original: spacedMatch[0] };
     }
   }
 
@@ -1451,25 +1582,43 @@ function parseWeekdays(text) {
 }
 
 /**
- * Get the next occurrence of a specific weekday
- * @param {Date} fromDate - Starting date
- * @param {string} dayCode - Day code like 'MO', 'TU', etc.
- * @returns {Date} - The next occurrence of that day
+ * First occurrence of any day in the pattern, at or after `now`, keeping the
+ * time of day from `timeSource`.
+ *
+ * The old version wrote the target date field by field (setFullYear, then
+ * setMonth, then setDate) which overflows: Jan 31 -> setMonth(1) is Mar 3.
+ * @returns {Date|null}
  */
-function getNextWeekday(fromDate, dayCode) {
-  const dayMap = { 'SU': 0, 'MO': 1, 'TU': 2, 'WE': 3, 'TH': 4, 'FR': 5, 'SA': 6 };
-  const targetDay = dayMap[dayCode];
-  const currentDay = fromDate.getDay();
+function nextRecurrenceStart(now, dayCodes, timeSource) {
+  const dayNumbers = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
+  let best = null;
 
-  let daysToAdd = targetDay - currentDay;
-  if (daysToAdd < 0) {
-    daysToAdd += 7;
+  for (const code of dayCodes) {
+    const targetDay = dayNumbers[code];
+    if (targetDay === undefined) {
+      continue;
+    }
+
+    const candidate = new Date(now);
+    candidate.setHours(timeSource.getHours(), timeSource.getMinutes(), 0, 0);
+
+    let daysToAdd = targetDay - candidate.getDay();
+    if (daysToAdd < 0) {
+      daysToAdd += 7;
+    }
+    candidate.setDate(candidate.getDate() + daysToAdd);
+
+    // Today's class has already started - go to next week's
+    if (candidate < now) {
+      candidate.setDate(candidate.getDate() + 7);
+    }
+
+    if (!best || candidate < best) {
+      best = candidate;
+    }
   }
-  // If it's the same day, use today (daysToAdd = 0)
 
-  const result = new Date(fromDate);
-  result.setDate(result.getDate() + daysToAdd);
-  return result;
+  return best;
 }
 
 // =============================================================================
@@ -1482,14 +1631,17 @@ function getNextWeekday(fromDate, dayCode) {
 function formatDateForCalendar(date) {
   const pad = (n) => n.toString().padStart(2, '0');
 
-  const year = date.getFullYear();
-  const month = pad(date.getMonth() + 1);
-  const day = pad(date.getDate());
-  const hours = pad(date.getHours());
-  const minutes = pad(date.getMinutes());
-  const seconds = pad(date.getSeconds());
+  // UTC with the trailing Z. A naked local timestamp is interpreted in the
+  // timezone of the user's Google Calendar, which is not necessarily the
+  // timezone of the browser that parsed the text.
+  const year = date.getUTCFullYear();
+  const month = pad(date.getUTCMonth() + 1);
+  const day = pad(date.getUTCDate());
+  const hours = pad(date.getUTCHours());
+  const minutes = pad(date.getUTCMinutes());
+  const seconds = pad(date.getUTCSeconds());
 
-  return `${year}${month}${day}T${hours}${minutes}${seconds}`;
+  return `${year}${month}${day}T${hours}${minutes}${seconds}Z`;
 }
 
 /**
@@ -1498,19 +1650,28 @@ function formatDateForCalendar(date) {
 function createGoogleCalendarUrl(eventData) {
   const baseUrl = 'https://calendar.google.com/calendar/render';
 
+  if (!isValidDate(eventData.startDate) || !isValidDate(eventData.endDate)) {
+    throw new Error('Cannot build calendar URL without a valid start and end date');
+  }
+
   const startFormatted = formatDateForCalendar(eventData.startDate);
   const endFormatted = formatDateForCalendar(eventData.endDate);
 
+  // Selections can be long; keep the generated URL well inside browser limits
+  const title = truncate((eventData.title || '').trim(), CONFIG.MAX_TITLE_LENGTH) || 'New Event';
+  const details = truncate(eventData.description || '', CONFIG.MAX_DETAILS_LENGTH);
+
   const params = new URLSearchParams({
     action: 'TEMPLATE',
-    text: eventData.title,
+    text: title,
     dates: `${startFormatted}/${endFormatted}`,
-    details: eventData.description
+    details: details
   });
 
   // Add recurrence rule if this is a recurring event
-  if (eventData.recurrence && eventData.recurrence.isRecurring) {
-    const rrule = `RRULE:FREQ=${eventData.recurrence.frequency};BYDAY=${eventData.recurrence.days.join(',')}`;
+  const recurrence = eventData.recurrence;
+  if (recurrence && recurrence.isRecurring && recurrence.days.length > 0) {
+    const rrule = `RRULE:FREQ=${recurrence.frequency};BYDAY=${recurrence.days.join(',')}`;
     params.append('recur', rrule);
     log('Added recurrence rule:', rrule);
   }

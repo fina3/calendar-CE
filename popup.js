@@ -8,23 +8,31 @@ document.addEventListener('DOMContentLoaded', () => {
   const confirmCancel = document.getElementById('confirm-cancel');
   const confirmClear = document.getElementById('confirm-clear');
 
-  // Load and render recent events
+  const EVENT_LIMIT = 5;
+  const REMOVE_ANIMATION_MS = 200;
+
+  // Timers started by card removal, cleared if the list is re-rendered (or the
+  // popup closes) before they fire so no callback ever runs against a detached
+  // card.
+  const pendingRemovals = new Set();
+
+  // The footer button would otherwise flash before the first render decides
+  // whether there is any history to clear.
+  clearBtn.style.display = 'none';
+
   loadRecentEvents();
 
-  // Clear history button
   clearBtn.addEventListener('click', () => {
     showModal();
   });
 
-  // Modal cancel
   confirmCancel.addEventListener('click', () => {
     hideModal();
   });
 
-  // Modal confirm clear
   confirmClear.addEventListener('click', async () => {
-    await clearHistory();
     hideModal();
+    await clearHistory();
   });
 
   // Close modal on background click
@@ -41,49 +49,75 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
+  // Keep the list in step with events created while the popup is open
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName === 'local' && changes.recentEvents) {
+      renderEvents(sanitize(changes.recentEvents.newValue).slice(0, EVENT_LIMIT));
+    }
+  });
+
+  window.addEventListener('pagehide', clearPendingRemovals);
+
   /**
-   * Load recent events using message API
+   * Ask the background worker for data, falling back to direct storage reads.
+   * sendMessage rejects (or resolves undefined) whenever the service worker is
+   * still starting up, so every caller has to cope with a missing response.
+   */
+  async function sendMessage(message) {
+    try {
+      const response = await chrome.runtime.sendMessage(message);
+      return response || { success: false, error: 'No response from background worker' };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Drop anything that is not a usable event record
+   */
+  function sanitize(events) {
+    if (!Array.isArray(events)) {
+      return [];
+    }
+    return events.filter((event) => event && typeof event === 'object' && typeof event.id === 'string');
+  }
+
+  /**
+   * Load recent events using the message API
    */
   async function loadRecentEvents() {
-    console.log('=== loadRecentEvents START ===');
-    try {
-      console.log('Sending getRecentEvents message to background...');
-      const response = await chrome.runtime.sendMessage({
-        action: 'getRecentEvents',
-        limit: 5
-      });
-      console.log('Response from background:', JSON.stringify(response, null, 2));
+    const response = await sendMessage({ action: 'getRecentEvents', limit: EVENT_LIMIT });
 
-      if (response.success) {
-        console.log('Events received:', response.events.length);
-        renderEvents(response.events);
-      } else {
-        console.error('Failed to load events:', response.error);
-        renderEvents([]);
-      }
-    } catch (error) {
-      console.error('Error loading events via message:', error);
-      console.log('Falling back to direct storage access...');
-      // Fallback to direct storage access if message fails
-      try {
-        const result = await chrome.storage.local.get(['recentEvents']);
-        console.log('Direct storage result:', JSON.stringify(result, null, 2));
-        const events = result.recentEvents || [];
-        console.log('Events from direct storage:', events.length);
-        renderEvents(events);
-      } catch (fallbackError) {
-        console.error('Fallback also failed:', fallbackError);
-        renderEvents([]);
-      }
+    if (response.success) {
+      renderEvents(sanitize(response.events));
+      return;
     }
-    console.log('=== loadRecentEvents END ===');
+
+    console.error('Failed to load events:', response.error);
+
+    // Fallback to direct storage access if the message failed
+    try {
+      const result = await chrome.storage.local.get(['recentEvents']);
+      renderEvents(sanitize(result.recentEvents).slice(0, EVENT_LIMIT));
+    } catch (fallbackError) {
+      console.error('Could not read event history:', fallbackError);
+      renderEvents([]);
+    }
+  }
+
+  function clearPendingRemovals() {
+    for (const timer of pendingRemovals) {
+      clearTimeout(timer);
+    }
+    pendingRemovals.clear();
   }
 
   /**
    * Render events list
    */
   function renderEvents(events) {
-    eventsList.innerHTML = '';
+    clearPendingRemovals();
+    eventsList.replaceChildren();
 
     if (events.length === 0) {
       emptyState.classList.add('visible');
@@ -94,10 +128,11 @@ document.addEventListener('DOMContentLoaded', () => {
     emptyState.classList.remove('visible');
     clearBtn.style.display = 'block';
 
+    const fragment = document.createDocumentFragment();
     events.forEach((event, index) => {
-      const card = createEventCard(event, index);
-      eventsList.appendChild(card);
+      fragment.appendChild(createEventCard(event, index));
     });
+    eventsList.appendChild(fragment);
   }
 
   /**
@@ -112,8 +147,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // Title
     const title = document.createElement('div');
     title.className = 'event-title';
-    title.textContent = event.title;
-    title.title = event.originalText || event.title;
+    title.textContent = event.title || '(untitled)';
+    title.title = event.originalText || event.title || '';
 
     // Date and confidence indicator
     const meta = document.createElement('div');
@@ -156,9 +191,10 @@ document.addEventListener('DOMContentLoaded', () => {
     deleteBtn.className = 'btn-delete';
     deleteBtn.textContent = '×';
     deleteBtn.title = 'Remove from history';
-    deleteBtn.addEventListener('click', async (e) => {
+    deleteBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      await deleteEvent(event.id, card);
+      deleteBtn.disabled = true;
+      deleteEvent(event.id, card, deleteBtn);
     });
 
     buttons.appendChild(createBtn);
@@ -176,33 +212,31 @@ document.addEventListener('DOMContentLoaded', () => {
    */
   function formatEventDate(dateString) {
     const date = new Date(dateString);
+    if (isNaN(date.getTime())) {
+      return 'Unknown date';
+    }
+
     const now = new Date();
-    const tomorrow = new Date(now);
-    tomorrow.setDate(tomorrow.getDate() + 1);
 
     const timeStr = date.toLocaleTimeString([], {
       hour: 'numeric',
       minute: '2-digit'
     });
 
-    // Check if today
-    if (date.toDateString() === now.toDateString()) {
+    const dayOffset = Math.round(
+      (startOfDay(date) - startOfDay(now)) / (24 * 60 * 60 * 1000)
+    );
+
+    if (dayOffset === 0) {
       return `Today at ${timeStr}`;
     }
-
-    // Check if tomorrow
-    if (date.toDateString() === tomorrow.toDateString()) {
+    if (dayOffset === 1) {
       return `Tomorrow at ${timeStr}`;
     }
-
-    // Check if yesterday
-    const yesterday = new Date(now);
-    yesterday.setDate(yesterday.getDate() - 1);
-    if (date.toDateString() === yesterday.toDateString()) {
+    if (dayOffset === -1) {
       return `Yesterday at ${timeStr}`;
     }
 
-    // Otherwise show full date
     const dateStr = date.toLocaleDateString([], {
       weekday: 'short',
       month: 'short',
@@ -212,46 +246,45 @@ document.addEventListener('DOMContentLoaded', () => {
     return `${dateStr} at ${timeStr}`;
   }
 
+  function startOfDay(date) {
+    const copy = new Date(date);
+    copy.setHours(0, 0, 0, 0);
+    return copy;
+  }
+
   /**
    * Handle "Create Again" click
    */
   function createAgain(event) {
-    if (event.calendarUrl) {
+    if (typeof event.calendarUrl === 'string' && event.calendarUrl.startsWith('https://calendar.google.com/')) {
       chrome.tabs.create({ url: event.calendarUrl });
+    } else {
+      console.error('Event has no usable calendar URL');
     }
   }
 
   /**
    * Delete a specific event
    */
-  async function deleteEvent(eventId, cardElement) {
-    try {
-      // Add removing animation
-      cardElement.classList.add('removing');
+  async function deleteEvent(eventId, cardElement, deleteBtn) {
+    cardElement.classList.add('removing');
 
-      const response = await chrome.runtime.sendMessage({
-        action: 'deleteEvent',
-        id: eventId
-      });
+    const response = await sendMessage({ action: 'deleteEvent', id: eventId });
 
-      if (response.success && response.deleted) {
-        // Wait for animation then remove
-        setTimeout(() => {
-          cardElement.remove();
-          // Check if list is now empty
-          if (eventsList.children.length === 0) {
-            emptyState.classList.add('visible');
-            clearBtn.style.display = 'none';
-          }
-        }, 200);
-      } else {
-        cardElement.classList.remove('removing');
-        console.error('Failed to delete event');
-      }
-    } catch (error) {
+    if (!response.success || !response.deleted) {
       cardElement.classList.remove('removing');
-      console.error('Error deleting event:', error);
+      deleteBtn.disabled = false;
+      console.error('Failed to delete event:', response.error || 'not found');
+      return;
     }
+
+    // Let the removal animation finish, then reload so an older event can take
+    // the freed slot instead of leaving the list short.
+    const timer = setTimeout(() => {
+      pendingRemovals.delete(timer);
+      loadRecentEvents();
+    }, REMOVE_ANIMATION_MS);
+    pendingRemovals.add(timer);
   }
 
   /**
@@ -267,31 +300,28 @@ document.addEventListener('DOMContentLoaded', () => {
    */
   function hideModal() {
     confirmModal.classList.remove('visible');
+    clearBtn.focus();
   }
 
   /**
-   * Clear all history using message API
+   * Clear all history using the message API
    */
   async function clearHistory() {
-    try {
-      const response = await chrome.runtime.sendMessage({
-        action: 'clearHistory'
-      });
+    const response = await sendMessage({ action: 'clearHistory' });
 
-      if (response.success) {
-        renderEvents([]);
-      } else {
-        console.error('Failed to clear history:', response.error);
-      }
-    } catch (error) {
-      console.error('Error clearing history:', error);
-      // Fallback to direct storage access
-      try {
-        await chrome.storage.local.set({ recentEvents: [] });
-        renderEvents([]);
-      } catch (fallbackError) {
-        console.error('Fallback also failed:', fallbackError);
-      }
+    if (response.success) {
+      renderEvents([]);
+      return;
+    }
+
+    console.error('Failed to clear history:', response.error);
+
+    // Fallback to direct storage access
+    try {
+      await chrome.storage.local.set({ recentEvents: [] });
+      renderEvents([]);
+    } catch (fallbackError) {
+      console.error('Could not clear history:', fallbackError);
     }
   }
 });
